@@ -49,6 +49,11 @@ function subscribe(store, ...callbacks) {
   const unsub = store.subscribe(...callbacks);
   return unsub.unsubscribe ? () => unsub.unsubscribe() : unsub;
 }
+function get_store_value(store) {
+  let value;
+  subscribe(store, (_) => value = _)();
+  return value;
+}
 function component_subscribe(component, store, callback) {
   component.$$.on_destroy.push(subscribe(store, callback));
 }
@@ -188,6 +193,20 @@ function set_style(node, key, value, important) {
     node.style.setProperty(key, value, important ? "important" : "");
   }
 }
+function select_option(select, value) {
+  for (let i = 0; i < select.options.length; i += 1) {
+    const option = select.options[i];
+    if (option.__value === value) {
+      option.selected = true;
+      return;
+    }
+  }
+  select.selectedIndex = -1;
+}
+function select_value(select) {
+  const selected_option = select.querySelector(":checked") || select.options[0];
+  return selected_option && selected_option.__value;
+}
 function toggle_class(element2, name, toggle) {
   element2.classList[toggle ? "add" : "remove"](name);
 }
@@ -322,6 +341,77 @@ function transition_out(block, local, detach2, callback) {
     block.o(local);
   }
 }
+function destroy_block(block, lookup) {
+  block.d(1);
+  lookup.delete(block.key);
+}
+function update_keyed_each(old_blocks, dirty, get_key, dynamic, ctx, list, lookup, node, destroy, create_each_block2, next, get_context) {
+  let o = old_blocks.length;
+  let n = list.length;
+  let i = o;
+  const old_indexes = {};
+  while (i--)
+    old_indexes[old_blocks[i].key] = i;
+  const new_blocks = [];
+  const new_lookup = /* @__PURE__ */ new Map();
+  const deltas = /* @__PURE__ */ new Map();
+  i = n;
+  while (i--) {
+    const child_ctx = get_context(ctx, list, i);
+    const key = get_key(child_ctx);
+    let block = lookup.get(key);
+    if (!block) {
+      block = create_each_block2(key, child_ctx);
+      block.c();
+    } else if (dynamic) {
+      block.p(child_ctx, dirty);
+    }
+    new_lookup.set(key, new_blocks[i] = block);
+    if (key in old_indexes)
+      deltas.set(key, Math.abs(i - old_indexes[key]));
+  }
+  const will_move = /* @__PURE__ */ new Set();
+  const did_move = /* @__PURE__ */ new Set();
+  function insert2(block) {
+    transition_in(block, 1);
+    block.m(node, next);
+    lookup.set(block.key, block);
+    next = block.first;
+    n--;
+  }
+  while (o && n) {
+    const new_block = new_blocks[n - 1];
+    const old_block = old_blocks[o - 1];
+    const new_key = new_block.key;
+    const old_key = old_block.key;
+    if (new_block === old_block) {
+      next = new_block.first;
+      o--;
+      n--;
+    } else if (!new_lookup.has(old_key)) {
+      destroy(old_block, lookup);
+      o--;
+    } else if (!lookup.has(new_key) || will_move.has(new_key)) {
+      insert2(new_block);
+    } else if (did_move.has(old_key)) {
+      o--;
+    } else if (deltas.get(new_key) > deltas.get(old_key)) {
+      did_move.add(new_key);
+      insert2(new_block);
+    } else {
+      will_move.add(old_key);
+      o--;
+    }
+  }
+  while (o--) {
+    const old_block = old_blocks[o];
+    if (!new_lookup.has(old_block.key))
+      destroy(old_block, lookup);
+  }
+  while (n)
+    insert2(new_blocks[n - 1]);
+  return new_blocks;
+}
 function create_component(block) {
   block && block.c();
 }
@@ -431,6 +521,91 @@ class SvelteComponent {
       this.$$.skip_bound = false;
     }
   }
+}
+const subscriber_queue = [];
+function readable(value, start) {
+  return {
+    subscribe: writable(value, start).subscribe
+  };
+}
+function writable(value, start = noop) {
+  let stop;
+  const subscribers = /* @__PURE__ */ new Set();
+  function set2(new_value) {
+    if (safe_not_equal(value, new_value)) {
+      value = new_value;
+      if (stop) {
+        const run_queue = !subscriber_queue.length;
+        for (const subscriber of subscribers) {
+          subscriber[1]();
+          subscriber_queue.push(subscriber, value);
+        }
+        if (run_queue) {
+          for (let i = 0; i < subscriber_queue.length; i += 2) {
+            subscriber_queue[i][0](subscriber_queue[i + 1]);
+          }
+          subscriber_queue.length = 0;
+        }
+      }
+    }
+  }
+  function update2(fn) {
+    set2(fn(value));
+  }
+  function subscribe2(run2, invalidate = noop) {
+    const subscriber = [run2, invalidate];
+    subscribers.add(subscriber);
+    if (subscribers.size === 1) {
+      stop = start(set2) || noop;
+    }
+    run2(value);
+    return () => {
+      subscribers.delete(subscriber);
+      if (subscribers.size === 0) {
+        stop();
+        stop = null;
+      }
+    };
+  }
+  return { set: set2, update: update2, subscribe: subscribe2 };
+}
+function derived(stores, fn, initial_value) {
+  const single = !Array.isArray(stores);
+  const stores_array = single ? [stores] : stores;
+  const auto = fn.length < 2;
+  return readable(initial_value, (set2) => {
+    let inited = false;
+    const values = [];
+    let pending = 0;
+    let cleanup = noop;
+    const sync = () => {
+      if (pending) {
+        return;
+      }
+      cleanup();
+      const result = fn(single ? values[0] : values, set2);
+      if (auto) {
+        set2(result);
+      } else {
+        cleanup = is_function(result) ? result : noop;
+      }
+    };
+    const unsubscribers = stores_array.map((store, i) => subscribe(store, (value) => {
+      values[i] = value;
+      pending &= ~(1 << i);
+      if (inited) {
+        sync();
+      }
+    }, () => {
+      pending |= 1 << i;
+    }));
+    inited = true;
+    sync();
+    return function stop() {
+      run_all(unsubscribers);
+      cleanup();
+    };
+  });
 }
 var commonjsGlobal = typeof globalThis !== "undefined" ? globalThis : typeof window !== "undefined" ? window : typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : {};
 function getDefaultExportFromCjs(x) {
@@ -5120,14 +5295,14 @@ function setMinutes(dirtyDate, dirtyMinutes) {
   return date2;
 }
 const parseDate = parse;
-function formatDate(date2, fmt, tz) {
+function formatDate(date2, fmt2, tz) {
   if (tz) {
     date2 = utcToZonedTime(date2, tz);
   }
   if (typeof date2 === "string") {
     date2 = new Date(date2);
   }
-  return format(date2, fmt, { locale: ru });
+  return format(date2, fmt2, { locale: ru });
 }
 function formatDateDistance(date2, baseDate, options) {
   return formatDistance(date2, baseDate, __spreadProps(__spreadValues({}, options || {}), {
@@ -8472,12 +8647,17 @@ var require$$0 = /* @__PURE__ */ getAugmentedNamespace(esm);
   });
 })(svelteImask, svelteImask.exports);
 var BookingConfirm_svelte_svelte_type_style_lang = "";
-function add_css$3(target) {
-  append_styles(target, "bit-1qp3fwv", ".form-field.bit-1qp3fwv.bit-1qp3fwv{display:flex;flex-direction:column;margin-top:10px}.form-field.bit-1qp3fwv label.bit-1qp3fwv{margin-bottom:5px}.fio.bit-1qp3fwv.bit-1qp3fwv{margin-top:5px}.input.bit-1qp3fwv.bit-1qp3fwv{padding:5px 10px;border-color:var(--bit-ca-border-color);border-style:solid;border-width:1px;border-radius:4px}.input.bit-1qp3fwv.bit-1qp3fwv:focus,.input.bit-1qp3fwv.bit-1qp3fwv:focus-visible{outline-width:1px;outline-style:solid;outline-color:var(--bit-ca-accent-lighter-color)}.booking-confirm.bit-1qp3fwv.bit-1qp3fwv{display:flex;color:#464646}.summary.bit-1qp3fwv.bit-1qp3fwv{flex:1 1 auto;padding:16px;background-color:var(--bit-ca-bg);border-radius:4px;border:1px solid #ddd}.summ.bit-1qp3fwv.bit-1qp3fwv{display:flex;justify-content:space-between;padding-right:13px;font-size:1.15rem}.place-name.bit-1qp3fwv.bit-1qp3fwv{font-weight:500}.contact.bit-1qp3fwv.bit-1qp3fwv{flex:1 1 auto;padding:0 16px}.confirm-btn.bit-1qp3fwv.bit-1qp3fwv{width:100%;padding:12px 20px;margin-top:20px;background-color:var(--bit-ca-accent-color);color:white;font-weight:700;border:none;border-radius:4px;cursor:pointer}.confirm-btn.bit-1qp3fwv.bit-1qp3fwv:disabled{background-color:var(--bit-ca-accent-lighter-color)}.section.bit-1qp3fwv.bit-1qp3fwv{margin-top:1rem}.products.bit-1qp3fwv.bit-1qp3fwv{margin-top:1rem}.product.bit-1qp3fwv.bit-1qp3fwv{display:flex;padding:2px 0;margin-bottom:6px;border-radius:4px}.product.bit-1qp3fwv>div.bit-1qp3fwv{padding:4px 12px}.product.bit-1qp3fwv>div.bit-1qp3fwv:first-child{padding-left:0}.product-day.bit-1qp3fwv.bit-1qp3fwv{min-width:70px}.product-amount.bit-1qp3fwv.bit-1qp3fwv{min-width:80px;text-align:right}.product-duration.bit-1qp3fwv.bit-1qp3fwv{min-width:100px;text-align:right}@media(max-width: 640px){.booking-confirm.bit-1qp3fwv.bit-1qp3fwv{flex-direction:column}.contact.bit-1qp3fwv.bit-1qp3fwv{margin-top:1rem}.fio.bit-1qp3fwv.bit-1qp3fwv{display:flex;flex-direction:column}.fio.bit-1qp3fwv input.bit-1qp3fwv:first-child{margin-bottom:10px}}.mobile-view .products.bit-1qp3fwv.bit-1qp3fwv{max-height:300px;overflow:auto}.mobile-view .product.bit-1qp3fwv>div.bit-1qp3fwv{padding:4px 6px}.mobile-view .product.bit-1qp3fwv .product-amount.bit-1qp3fwv{min-width:40px;flex:1}.mobile-view .product.bit-1qp3fwv .product-duration.bit-1qp3fwv{min-width:80px}");
+function add_css$4(target) {
+  append_styles(target, "bit-j3u39s", ".form-field.bit-j3u39s.bit-j3u39s{display:flex;flex-direction:column;margin-top:10px}.form-field.bit-j3u39s label.bit-j3u39s{margin-bottom:5px}.fio.bit-j3u39s.bit-j3u39s{margin-top:5px}.input.bit-j3u39s.bit-j3u39s{padding:10px 10px;border-color:var(--bit-ca-border-color);border-style:solid;border-width:1px;border-radius:var(--border-radius-base)}.input.bit-j3u39s.bit-j3u39s:focus,.input.bit-j3u39s.bit-j3u39s:focus-visible{outline-width:1px;outline-style:solid;outline-color:var(--bit-ca-accent-lighter-color)}.booking-confirm.bit-j3u39s.bit-j3u39s{display:flex;color:#464646}.summary.bit-j3u39s.bit-j3u39s{flex:1 1 auto;padding:16px;background-color:var(--bit-ca-bg);border-radius:var(--border-radius-base);border:1px solid #ddd}.summ.bit-j3u39s.bit-j3u39s{display:flex;justify-content:space-between;padding-right:13px;font-size:1.15rem;font-weight:600}.place-name.bit-j3u39s.bit-j3u39s{font-weight:500}.contact.bit-j3u39s.bit-j3u39s{flex:1 1 auto;padding:0 16px}.confirm-btn.bit-j3u39s.bit-j3u39s{width:100%;padding:12px 20px;margin-top:20px;background-color:var(--bit-ca-accent-color);color:white;font-weight:700;border:none;border-radius:var(--border-radius-base);cursor:pointer}.confirm-btn.bit-j3u39s.bit-j3u39s:disabled{background-color:var(--bit-ca-accent-lighter-color)}.section.bit-j3u39s.bit-j3u39s{margin-top:1rem}.products.bit-j3u39s.bit-j3u39s{margin-top:1rem}.product.bit-j3u39s.bit-j3u39s{display:flex;padding:2px 0;margin-bottom:6px;border-radius:var(--border-radius-base)}.product.bit-j3u39s>div.bit-j3u39s{padding:4px 12px}.product.bit-j3u39s>div.bit-j3u39s:first-child{padding-left:0}.product-day.bit-j3u39s.bit-j3u39s{min-width:70px}.product-amount.bit-j3u39s.bit-j3u39s{min-width:80px;text-align:right}.product-duration.bit-j3u39s.bit-j3u39s{min-width:100px;text-align:right}@media(max-width: 640px){.booking-confirm.bit-j3u39s.bit-j3u39s{flex-direction:column}.contact.bit-j3u39s.bit-j3u39s{margin-top:1rem}.fio.bit-j3u39s.bit-j3u39s{display:flex;flex-direction:column}.fio.bit-j3u39s input.bit-j3u39s:first-child{margin-bottom:10px}}.mobile-view .products.bit-j3u39s.bit-j3u39s{max-height:300px;overflow:auto}.mobile-view .product.bit-j3u39s>div.bit-j3u39s{padding:4px 6px}.mobile-view .product.bit-j3u39s .product-amount.bit-j3u39s{min-width:40px;flex:1}.mobile-view .product.bit-j3u39s .product-duration.bit-j3u39s{min-width:80px}.select.bit-j3u39s.bit-j3u39s{padding:10px 10px;border-color:var(--bit-ca-border-color);border-style:solid;border-width:1px;border-radius:var(--border-radius-base)}.select.bit-j3u39s.bit-j3u39s:focus,.select.bit-j3u39s.bit-j3u39s:focus-visible{outline-width:1px;outline-style:solid;outline-color:var(--bit-ca-accent-lighter-color)}");
 }
-function get_each_context$1(ctx, list, i) {
+function get_each_context$2(ctx, list, i) {
   const child_ctx = ctx.slice();
-  child_ctx[19] = list[i];
+  child_ctx[8] = list[i];
+  return child_ctx;
+}
+function get_each_context_1$1(ctx, list, i) {
+  const child_ctx = ctx.slice();
+  child_ctx[24] = list[i];
   return child_ctx;
 }
 function create_if_block_2$2(ctx) {
@@ -8487,7 +8667,7 @@ function create_if_block_2$2(ctx) {
     c() {
       div = element("div");
       t = text(ctx[2]);
-      attr(div, "class", "place-name bit-1qp3fwv");
+      attr(div, "class", "place-name bit-j3u39s");
     },
     m(target, anchor) {
       insert(target, div, anchor);
@@ -8526,7 +8706,7 @@ function create_if_block_1$2(ctx) {
     }
   };
 }
-function create_if_block$2(ctx) {
+function create_if_block$3(ctx) {
   let div;
   let t_value = ctx[1].name + "";
   let t;
@@ -8534,7 +8714,7 @@ function create_if_block$2(ctx) {
     c() {
       div = element("div");
       t = text(t_value);
-      attr(div, "class", "section bit-1qp3fwv");
+      attr(div, "class", "section bit-j3u39s");
     },
     m(target, anchor) {
       insert(target, div, anchor);
@@ -8550,18 +8730,18 @@ function create_if_block$2(ctx) {
     }
   };
 }
-function create_each_block$1(ctx) {
+function create_each_block_1$1(ctx) {
   let div4;
   let div0;
-  let t0_value = ctx[19].day + "";
+  let t0_value = ctx[24].day + "";
   let t0;
   let t1;
   let div1;
-  let t2_value = ctx[19].fromToName + "";
+  let t2_value = ctx[24].fromToName + "";
   let t2;
   let t3;
   let div2;
-  let t4_value = ctx[19].duration + "";
+  let t4_value = ctx[24].duration + "";
   let t4;
   let t5;
   let div3;
@@ -8583,11 +8763,11 @@ function create_each_block$1(ctx) {
       t5 = space();
       div3 = element("div");
       t6 = space();
-      attr(div0, "class", "product-day bit-1qp3fwv");
-      attr(div1, "class", "product-time bit-1qp3fwv");
-      attr(div2, "class", "product-duration bit-1qp3fwv");
-      attr(div3, "class", "product-amount bit-1qp3fwv");
-      attr(div4, "class", "product bit-1qp3fwv");
+      attr(div0, "class", "product-day bit-j3u39s");
+      attr(div1, "class", "product-time bit-j3u39s");
+      attr(div2, "class", "product-duration bit-j3u39s");
+      attr(div3, "class", "product-amount bit-j3u39s");
+      attr(div4, "class", "product bit-j3u39s");
     },
     m(target, anchor) {
       insert(target, div4, anchor);
@@ -8603,20 +8783,20 @@ function create_each_block$1(ctx) {
       append(div4, div3);
       append(div4, t6);
       if (!mounted) {
-        dispose = action_destroyer(fmtCurrency_action = fmtCurrency.call(null, div3, ctx[19].amount));
+        dispose = action_destroyer(fmtCurrency_action = fmtCurrency.call(null, div3, ctx[24].amount));
         mounted = true;
       }
     },
     p(new_ctx, dirty) {
       ctx = new_ctx;
-      if (dirty & 128 && t0_value !== (t0_value = ctx[19].day + ""))
+      if (dirty & 128 && t0_value !== (t0_value = ctx[24].day + ""))
         set_data(t0, t0_value);
-      if (dirty & 128 && t2_value !== (t2_value = ctx[19].fromToName + ""))
+      if (dirty & 128 && t2_value !== (t2_value = ctx[24].fromToName + ""))
         set_data(t2, t2_value);
-      if (dirty & 128 && t4_value !== (t4_value = ctx[19].duration + ""))
+      if (dirty & 128 && t4_value !== (t4_value = ctx[24].duration + ""))
         set_data(t4, t4_value);
       if (fmtCurrency_action && is_function(fmtCurrency_action.update) && dirty & 128)
-        fmtCurrency_action.update.call(null, ctx[19].amount);
+        fmtCurrency_action.update.call(null, ctx[24].amount);
     },
     d(detaching) {
       if (detaching)
@@ -8626,8 +8806,34 @@ function create_each_block$1(ctx) {
     }
   };
 }
-function create_fragment$3(ctx) {
-  let div10;
+function create_each_block$2(ctx) {
+  let option;
+  let t0_value = ctx[8].name + "";
+  let t0;
+  let t1;
+  let option_value_value;
+  return {
+    c() {
+      option = element("option");
+      t0 = text(t0_value);
+      t1 = space();
+      option.__value = option_value_value = ctx[8];
+      option.value = option.__value;
+    },
+    m(target, anchor) {
+      insert(target, option, anchor);
+      append(option, t0);
+      append(option, t1);
+    },
+    p: noop,
+    d(detaching) {
+      if (detaching)
+        detach(option);
+    }
+  };
+}
+function create_fragment$4(ctx) {
+  let div11;
   let div4;
   let t0;
   let t1;
@@ -8642,7 +8848,7 @@ function create_fragment$3(ctx) {
   let div2;
   let fmtCurrency_action;
   let t7;
-  let div9;
+  let div10;
   let div5;
   let t9;
   let div6;
@@ -8660,22 +8866,33 @@ function create_fragment$3(ctx) {
   let t16;
   let input3;
   let t17;
+  let div9;
+  let label2;
+  let t19;
+  let select;
+  let option;
+  let t21;
   let button;
-  let t18_value = ctx[6] ? "\u0411\u0440\u043E\u043D\u0438\u0440\u043E\u0432\u0430\u043D\u0438\u0435..." : "\u0417\u0430\u0431\u0440\u043E\u043D\u0438\u0440\u043E\u0432\u0430\u0442\u044C";
-  let t18;
+  let t22_value = ctx[6] ? "\u0411\u0440\u043E\u043D\u0438\u0440\u043E\u0432\u0430\u043D\u0438\u0435..." : "\u0417\u0430\u0431\u0440\u043E\u043D\u0438\u0440\u043E\u0432\u0430\u0442\u044C";
+  let t22;
   let mounted;
   let dispose;
   let if_block0 = ctx[2] && create_if_block_2$2(ctx);
   let if_block1 = ctx[3] && create_if_block_1$2(ctx);
-  let if_block2 = ctx[1] && create_if_block$2(ctx);
-  let each_value = ctx[7].bookingsArray;
+  let if_block2 = ctx[1] && create_if_block$3(ctx);
+  let each_value_1 = ctx[7].bookingsArray;
+  let each_blocks_1 = [];
+  for (let i = 0; i < each_value_1.length; i += 1) {
+    each_blocks_1[i] = create_each_block_1$1(get_each_context_1$1(ctx, each_value_1, i));
+  }
+  let each_value = ctx[13];
   let each_blocks = [];
   for (let i = 0; i < each_value.length; i += 1) {
-    each_blocks[i] = create_each_block$1(get_each_context$1(ctx, each_value, i));
+    each_blocks[i] = create_each_block$2(get_each_context$2(ctx, each_value, i));
   }
   return {
     c() {
-      div10 = element("div");
+      div11 = element("div");
       div4 = element("div");
       if (if_block0)
         if_block0.c();
@@ -8687,8 +8904,8 @@ function create_fragment$3(ctx) {
         if_block2.c();
       t2 = space();
       div0 = element("div");
-      for (let i = 0; i < each_blocks.length; i += 1) {
-        each_blocks[i].c();
+      for (let i = 0; i < each_blocks_1.length; i += 1) {
+        each_blocks_1[i].c();
       }
       t3 = space();
       hr = element("hr");
@@ -8699,9 +8916,9 @@ function create_fragment$3(ctx) {
       t6 = space();
       div2 = element("div");
       t7 = space();
-      div9 = element("div");
+      div10 = element("div");
       div5 = element("div");
-      div5.textContent = "\u041A\u043E\u043D\u0442\u0430\u043A\u0442";
+      div5.textContent = "\u041A\u043B\u0438\u0435\u043D\u0442";
       t9 = space();
       div6 = element("div");
       input0 = element("input");
@@ -8720,43 +8937,62 @@ function create_fragment$3(ctx) {
       t16 = space();
       input3 = element("input");
       t17 = space();
+      div9 = element("div");
+      label2 = element("label");
+      label2.textContent = "\u0410\u043A\u0442\u0438\u0432\u043D\u043E\u0441\u0442\u044C";
+      t19 = space();
+      select = element("select");
+      option = element("option");
+      option.textContent = "\u041D\u0435 \u0432\u044B\u0431\u0440\u0430\u043D\u043E";
+      for (let i = 0; i < each_blocks.length; i += 1) {
+        each_blocks[i].c();
+      }
+      t21 = space();
       button = element("button");
-      t18 = text(t18_value);
-      attr(div0, "class", "products bit-1qp3fwv");
+      t22 = text(t22_value);
+      attr(div0, "class", "products bit-j3u39s");
       attr(hr, "class", "line");
-      attr(div3, "class", "summ bit-1qp3fwv");
-      attr(div4, "class", "summary bit-1qp3fwv");
-      attr(input0, "class", "input bit-1qp3fwv");
+      attr(div3, "class", "summ fg-primary bit-j3u39s");
+      attr(div4, "class", "summary bit-j3u39s");
+      attr(input0, "class", "input bit-j3u39s");
       attr(input0, "type", "text");
       attr(input0, "name", "name");
       attr(input0, "placeholder", "\u0418\u043C\u044F");
-      attr(input1, "class", "input bit-1qp3fwv");
+      attr(input1, "class", "input bit-j3u39s");
       attr(input1, "type", "text");
       attr(input1, "name", "surname");
       attr(input1, "placeholder", "\u0424\u0430\u043C\u0438\u043B\u0438\u044F");
-      attr(div6, "class", "fio bit-1qp3fwv");
+      attr(div6, "class", "fio bit-j3u39s");
       attr(label0, "for", "");
-      attr(label0, "class", "bit-1qp3fwv");
-      attr(input2, "class", "input bit-1qp3fwv");
+      attr(label0, "class", "bit-j3u39s");
+      attr(input2, "class", "input bit-j3u39s");
       attr(input2, "type", "tel");
       attr(input2, "name", "phone");
-      attr(div7, "class", "form-field bit-1qp3fwv");
+      attr(div7, "class", "form-field bit-j3u39s");
       attr(label1, "for", "");
-      attr(label1, "class", "bit-1qp3fwv");
-      attr(input3, "class", "input bit-1qp3fwv");
+      attr(label1, "class", "bit-j3u39s");
+      attr(input3, "class", "input bit-j3u39s");
       attr(input3, "type", "email");
       attr(input3, "name", "email");
       attr(input3, "placeholder", "e-mail");
-      attr(div8, "class", "form-field bit-1qp3fwv");
-      attr(button, "class", "confirm-btn bit-1qp3fwv");
+      attr(div8, "class", "form-field bit-j3u39s");
+      attr(label2, "for", "");
+      attr(label2, "class", "bit-j3u39s");
+      option.__value = null;
+      option.value = option.__value;
+      attr(select, "class", "select bit-j3u39s");
+      if (ctx[8] === void 0)
+        add_render_callback(() => ctx[19].call(select));
+      attr(div9, "class", "form-field bit-j3u39s");
+      attr(button, "class", "confirm-btn bit-j3u39s");
       attr(button, "type", "button");
       button.disabled = ctx[6];
-      attr(div9, "class", "contact bit-1qp3fwv");
-      attr(div10, "class", "booking-confirm bit-1qp3fwv");
+      attr(div10, "class", "contact bit-j3u39s");
+      attr(div11, "class", "booking-confirm bit-j3u39s");
     },
     m(target, anchor) {
-      insert(target, div10, anchor);
-      append(div10, div4);
+      insert(target, div11, anchor);
+      append(div11, div4);
       if (if_block0)
         if_block0.m(div4, null);
       append(div4, t0);
@@ -8767,8 +9003,8 @@ function create_fragment$3(ctx) {
         if_block2.m(div4, null);
       append(div4, t2);
       append(div4, div0);
-      for (let i = 0; i < each_blocks.length; i += 1) {
-        each_blocks[i].m(div0, null);
+      for (let i = 0; i < each_blocks_1.length; i += 1) {
+        each_blocks_1[i].m(div0, null);
       }
       append(div4, t3);
       append(div4, hr);
@@ -8777,42 +9013,53 @@ function create_fragment$3(ctx) {
       append(div3, div1);
       append(div3, t6);
       append(div3, div2);
-      append(div10, t7);
-      append(div10, div9);
-      append(div9, div5);
-      append(div9, t9);
-      append(div9, div6);
+      append(div11, t7);
+      append(div11, div10);
+      append(div10, div5);
+      append(div10, t9);
+      append(div10, div6);
       append(div6, input0);
       set_input_value(input0, ctx[4].name);
       append(div6, t10);
       append(div6, input1);
       set_input_value(input1, ctx[4].surname);
-      append(div9, t11);
-      append(div9, div7);
+      append(div10, t11);
+      append(div10, div7);
       append(div7, label0);
       append(div7, t13);
       append(div7, input2);
       set_input_value(input2, ctx[5]);
-      append(div9, t14);
-      append(div9, div8);
+      append(div10, t14);
+      append(div10, div8);
       append(div8, label1);
       append(div8, t16);
       append(div8, input3);
       set_input_value(input3, ctx[4].email);
-      append(div9, t17);
-      append(div9, button);
-      append(button, t18);
+      append(div10, t17);
+      append(div10, div9);
+      append(div9, label2);
+      append(div9, t19);
+      append(div9, select);
+      append(select, option);
+      for (let i = 0; i < each_blocks.length; i += 1) {
+        each_blocks[i].m(select, null);
+      }
+      select_option(select, ctx[8]);
+      append(div10, t21);
+      append(div10, button);
+      append(button, t22);
       if (!mounted) {
         dispose = [
           action_destroyer(fmtCurrency_action = fmtCurrency.call(null, div2, ctx[7].totalAmount)),
-          listen(input0, "input", ctx[13]),
-          listen(input1, "input", ctx[14]),
-          listen(input2, "input", ctx[15]),
-          action_destroyer(svelteImask.exports.imask.call(null, input2, ctx[8])),
-          listen(input2, "accept", ctx[10]),
-          listen(input2, "complete", ctx[11]),
-          listen(input3, "input", ctx[16]),
-          listen(button, "click", ctx[9])
+          listen(input0, "input", ctx[15]),
+          listen(input1, "input", ctx[16]),
+          listen(input2, "input", ctx[17]),
+          action_destroyer(svelteImask.exports.imask.call(null, input2, ctx[9])),
+          listen(input2, "accept", ctx[11]),
+          listen(input2, "complete", ctx[12]),
+          listen(input3, "input", ctx[18]),
+          listen(select, "change", ctx[19]),
+          listen(button, "click", ctx[10])
         ];
         mounted = true;
       }
@@ -8846,7 +9093,7 @@ function create_fragment$3(ctx) {
         if (if_block2) {
           if_block2.p(ctx2, dirty);
         } else {
-          if_block2 = create_if_block$2(ctx2);
+          if_block2 = create_if_block$3(ctx2);
           if_block2.c();
           if_block2.m(div4, t2);
         }
@@ -8855,22 +9102,22 @@ function create_fragment$3(ctx) {
         if_block2 = null;
       }
       if (dirty & 128) {
-        each_value = ctx2[7].bookingsArray;
+        each_value_1 = ctx2[7].bookingsArray;
         let i;
-        for (i = 0; i < each_value.length; i += 1) {
-          const child_ctx = get_each_context$1(ctx2, each_value, i);
-          if (each_blocks[i]) {
-            each_blocks[i].p(child_ctx, dirty);
+        for (i = 0; i < each_value_1.length; i += 1) {
+          const child_ctx = get_each_context_1$1(ctx2, each_value_1, i);
+          if (each_blocks_1[i]) {
+            each_blocks_1[i].p(child_ctx, dirty);
           } else {
-            each_blocks[i] = create_each_block$1(child_ctx);
-            each_blocks[i].c();
-            each_blocks[i].m(div0, null);
+            each_blocks_1[i] = create_each_block_1$1(child_ctx);
+            each_blocks_1[i].c();
+            each_blocks_1[i].m(div0, null);
           }
         }
-        for (; i < each_blocks.length; i += 1) {
-          each_blocks[i].d(1);
+        for (; i < each_blocks_1.length; i += 1) {
+          each_blocks_1[i].d(1);
         }
-        each_blocks.length = each_value.length;
+        each_blocks_1.length = each_value_1.length;
       }
       if (fmtCurrency_action && is_function(fmtCurrency_action.update) && dirty & 128)
         fmtCurrency_action.update.call(null, ctx2[7].totalAmount);
@@ -8886,8 +9133,29 @@ function create_fragment$3(ctx) {
       if (dirty & 16 && input3.value !== ctx2[4].email) {
         set_input_value(input3, ctx2[4].email);
       }
-      if (dirty & 64 && t18_value !== (t18_value = ctx2[6] ? "\u0411\u0440\u043E\u043D\u0438\u0440\u043E\u0432\u0430\u043D\u0438\u0435..." : "\u0417\u0430\u0431\u0440\u043E\u043D\u0438\u0440\u043E\u0432\u0430\u0442\u044C"))
-        set_data(t18, t18_value);
+      if (dirty & 8192) {
+        each_value = ctx2[13];
+        let i;
+        for (i = 0; i < each_value.length; i += 1) {
+          const child_ctx = get_each_context$2(ctx2, each_value, i);
+          if (each_blocks[i]) {
+            each_blocks[i].p(child_ctx, dirty);
+          } else {
+            each_blocks[i] = create_each_block$2(child_ctx);
+            each_blocks[i].c();
+            each_blocks[i].m(select, null);
+          }
+        }
+        for (; i < each_blocks.length; i += 1) {
+          each_blocks[i].d(1);
+        }
+        each_blocks.length = each_value.length;
+      }
+      if (dirty & 8448) {
+        select_option(select, ctx2[8]);
+      }
+      if (dirty & 64 && t22_value !== (t22_value = ctx2[6] ? "\u0411\u0440\u043E\u043D\u0438\u0440\u043E\u0432\u0430\u043D\u0438\u0435..." : "\u0417\u0430\u0431\u0440\u043E\u043D\u0438\u0440\u043E\u0432\u0430\u0442\u044C"))
+        set_data(t22, t22_value);
       if (dirty & 64) {
         button.disabled = ctx2[6];
       }
@@ -8896,20 +9164,21 @@ function create_fragment$3(ctx) {
     o: noop,
     d(detaching) {
       if (detaching)
-        detach(div10);
+        detach(div11);
       if (if_block0)
         if_block0.d();
       if (if_block1)
         if_block1.d();
       if (if_block2)
         if_block2.d();
+      destroy_each(each_blocks_1, detaching);
       destroy_each(each_blocks, detaching);
       mounted = false;
       run_all(dispose);
     }
   };
 }
-function instance$3($$self, $$props, $$invalidate) {
+function instance$4($$self, $$props, $$invalidate) {
   let $selectedSlotsStore, $$unsubscribe_selectedSlotsStore = noop, $$subscribe_selectedSlotsStore = () => ($$unsubscribe_selectedSlotsStore(), $$unsubscribe_selectedSlotsStore = subscribe(selectedSlotsStore, ($$value) => $$invalidate(7, $selectedSlotsStore = $$value)), selectedSlotsStore);
   $$self.$$.on_destroy.push(() => $$unsubscribe_selectedSlotsStore());
   let { selectedSlotsStore } = $$props;
@@ -8931,13 +9200,15 @@ function instance$3($$self, $$props, $$invalidate) {
     mask: "{+7} (000) 000 00 00",
     lazy: false
   };
+  let activity = null;
   async function onBooking() {
-    if (!valid()) {
-      return;
+    const resultValid = valid();
+    if (resultValid !== true) {
+      return alert(resultValid);
     }
     try {
       $$invalidate(6, loading = true);
-      const result = await postBooking(contact);
+      const result = await postBooking(contact, { activity });
       dispatch2("ok", result);
     } catch (error) {
       dispatch2("error", error);
@@ -8953,16 +9224,72 @@ function instance$3($$self, $$props, $$invalidate) {
   }
   function valid() {
     if (contact.name.trim().length < 3) {
-      return false;
+      return "\u0417\u0430\u043F\u043E\u043B\u043D\u0438\u0442\u0435 \u0438\u043C\u044F";
     }
     if (contact.surname.trim().length < 3) {
-      return false;
+      return "\u0417\u0430\u043F\u043E\u043B\u043D\u0438\u0442\u0435 \u0444\u0430\u043C\u0438\u043B\u0438\u044E";
     }
     if (contact.phone.length !== 11) {
-      return false;
+      return "\u0417\u0430\u043F\u043E\u043B\u043D\u0438\u0442\u0435 \u0442\u0435\u043B\u0435\u0444\u043E\u043D";
+    }
+    if (contact.email.length < 3) {
+      return "\u0417\u0430\u043F\u043E\u043B\u043D\u0438\u0442\u0435 \u043F\u043E\u0447\u0442\u0443";
+    }
+    if (!activity) {
+      return "\u0417\u0430\u043F\u043E\u043B\u043D\u0438\u0442\u0435 \u0430\u043A\u0442\u0438\u0432\u043D\u043E\u0441\u0442\u044C";
     }
     return true;
   }
+  const activities = [
+    {
+      name: "\u0411\u0430\u0441\u043A\u0435\u0442\u0431\u043E\u043B",
+      fs_id: 8,
+      is_sport: true,
+      id: 3,
+      created_at: "2022-11-13T20:38:06.823707+00:00",
+      updated_at: "2022-11-13T20:38:06.823707+00:00"
+    },
+    {
+      name: "\u0412\u043E\u043B\u0435\u0439\u0431\u043E\u043B",
+      fs_id: 16,
+      is_sport: true,
+      id: 4,
+      created_at: "2022-11-13T20:38:07.150054+00:00",
+      updated_at: "2022-11-13T20:38:07.150054+00:00"
+    },
+    {
+      name: "\u0422\u0430\u043D\u0446\u044B",
+      fs_id: 128,
+      is_sport: false,
+      id: 5,
+      created_at: "2022-11-13T20:38:07.267753+00:00",
+      updated_at: "2022-11-13T20:38:07.267753+00:00"
+    },
+    {
+      name: "\u0414\u0440\u0443\u0433\u043E\u0435",
+      fs_id: 0,
+      is_sport: true,
+      id: 7,
+      created_at: "2022-11-13T20:38:07.467955+00:00",
+      updated_at: "2022-11-13T20:38:07.467955+00:00"
+    },
+    {
+      name: "\u0419\u043E\u0433\u0430",
+      fs_id: 2048,
+      is_sport: false,
+      id: 8,
+      created_at: "2022-11-13T20:38:07.586913+00:00",
+      updated_at: "2022-11-13T20:38:07.586913+00:00"
+    },
+    {
+      name: "\u0424\u0443\u0442\u0431\u043E\u043B",
+      fs_id: 4,
+      is_sport: true,
+      id: 1,
+      created_at: "2021-10-10T16:20:22.670969+00:00",
+      updated_at: "2021-10-10T16:20:22.670969+00:00"
+    }
+  ];
   function input0_input_handler() {
     contact.name = this.value;
     $$invalidate(4, contact);
@@ -8979,6 +9306,11 @@ function instance$3($$self, $$props, $$invalidate) {
     contact.email = this.value;
     $$invalidate(4, contact);
   }
+  function select_change_handler() {
+    activity = select_value(this);
+    $$invalidate(8, activity);
+    $$invalidate(13, activities);
+  }
   $$self.$$set = ($$props2) => {
     if ("selectedSlotsStore" in $$props2)
       $$subscribe_selectedSlotsStore($$invalidate(0, selectedSlotsStore = $$props2.selectedSlotsStore));
@@ -8989,7 +9321,7 @@ function instance$3($$self, $$props, $$invalidate) {
     if ("placeAddress" in $$props2)
       $$invalidate(3, placeAddress = $$props2.placeAddress);
     if ("postBooking" in $$props2)
-      $$invalidate(12, postBooking = $$props2.postBooking);
+      $$invalidate(14, postBooking = $$props2.postBooking);
   };
   return [
     selectedSlotsStore,
@@ -9000,31 +9332,34 @@ function instance$3($$self, $$props, $$invalidate) {
     phoneValue,
     loading,
     $selectedSlotsStore,
+    activity,
     options,
     onBooking,
     accept,
     complete,
+    activities,
     postBooking,
     input0_input_handler,
     input1_input_handler,
     input2_input_handler,
-    input3_input_handler
+    input3_input_handler,
+    select_change_handler
   ];
 }
 class BookingConfirm extends SvelteComponent {
   constructor(options) {
     super();
-    init(this, options, instance$3, create_fragment$3, safe_not_equal, {
+    init(this, options, instance$4, create_fragment$4, safe_not_equal, {
       selectedSlotsStore: 0,
       activeSection: 1,
       placeName: 2,
       placeAddress: 3,
-      postBooking: 12
-    }, add_css$3);
+      postBooking: 14
+    }, add_css$4);
   }
 }
 var Icon_svelte_svelte_type_style_lang = "";
-function add_css$2(target) {
+function add_css$3(target) {
   append_styles(target, "bit-jmrrtm", ".icon.bit-jmrrtm{display:inline-flex}");
 }
 function create_if_block_7$1(ctx) {
@@ -9341,7 +9676,7 @@ function create_if_block_1$1(ctx) {
     }
   };
 }
-function create_if_block$1(ctx) {
+function create_if_block$2(ctx) {
   let svg;
   let path;
   let svg_class_value;
@@ -9385,7 +9720,7 @@ function create_if_block$1(ctx) {
     }
   };
 }
-function create_fragment$2(ctx) {
+function create_fragment$3(ctx) {
   let span;
   let t0;
   let t1;
@@ -9403,7 +9738,7 @@ function create_fragment$2(ctx) {
   let if_block4 = ctx[2] === "cog" && create_if_block_3$1(ctx);
   let if_block5 = ctx[2] === "chevron-left" && create_if_block_2$1(ctx);
   let if_block6 = ctx[2] === "chevron-right" && create_if_block_1$1(ctx);
-  let if_block7 = ctx[2] === "check" && create_if_block$1(ctx);
+  let if_block7 = ctx[2] === "check" && create_if_block$2(ctx);
   return {
     c() {
       span = element("span");
@@ -9551,7 +9886,7 @@ function create_fragment$2(ctx) {
         if (if_block7) {
           if_block7.p(ctx2, dirty);
         } else {
-          if_block7 = create_if_block$1(ctx2);
+          if_block7 = create_if_block$2(ctx2);
           if_block7.c();
           if_block7.m(span, null);
         }
@@ -9586,7 +9921,7 @@ function create_fragment$2(ctx) {
     }
   };
 }
-function instance$2($$self, $$props, $$invalidate) {
+function instance$3($$self, $$props, $$invalidate) {
   let { name } = $$props;
   let { h = "1.5rem" } = $$props;
   let { w = "1.5rem" } = $$props;
@@ -9619,22 +9954,22 @@ function instance$2($$self, $$props, $$invalidate) {
 class Icon extends SvelteComponent {
   constructor(options) {
     super();
-    init(this, options, instance$2, create_fragment$2, safe_not_equal, {
+    init(this, options, instance$3, create_fragment$3, safe_not_equal, {
       name: 2,
       h: 0,
       w: 1,
       strokeWidth: 3,
       size: 5
-    }, add_css$2);
+    }, add_css$3);
   }
 }
 var BookingModal_svelte_svelte_type_style_lang = "";
-function add_css$1(target) {
-  append_styles(target, "bit-um98en", ".ellipsis.bit-um98en.bit-um98en{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}.mobile-view .overlay.bit-um98en.bit-um98en{position:fixed;padding:0}.mobile-view .overlay.bit-um98en .content.bit-um98en{height:100%;min-width:280px !important;border-radius:0;width:100%}.overlay.bit-um98en.bit-um98en{position:absolute;top:0;bottom:0;right:0;left:0;padding:1rem;background-color:rgba(0, 0, 0, 0.5);display:flex;justify-content:center;z-index:10}.overlay[data-position=center].bit-um98en.bit-um98en{align-items:center}.overlay[data-position=top].bit-um98en.bit-um98en{align-items:flex-start}.overlay[data-position=bottom].bit-um98en.bit-um98en{align-items:flex-end}.overlay.bit-um98en .content.bit-um98en{background-color:white;border-radius:4px;padding:10px;min-width:480px}.overlay.bit-um98en .header.bit-um98en{display:flex;font-size:1.2rem;font-weight:500;align-items:center;justify-content:space-between;margin-bottom:0.8rem}.overlay.bit-um98en .close-icon{cursor:pointer;color:rgba(0, 0, 0, 0.5)}.overlay.bit-um98en .close-icon:hover{color:currentColor}");
+function add_css$2(target) {
+  append_styles(target, "bit-1jgz48w", ".ellipsis.bit-1jgz48w.bit-1jgz48w{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}.mobile-view .overlay.bit-1jgz48w.bit-1jgz48w{position:fixed;padding:0}.mobile-view .overlay.bit-1jgz48w .content.bit-1jgz48w{height:100%;min-width:280px !important;border-radius:0;width:100%}.overlay.bit-1jgz48w.bit-1jgz48w{position:absolute;top:0;bottom:0;right:0;left:0;padding:1rem;background-color:rgba(0, 0, 0, 0.5);display:flex;justify-content:center;z-index:10}.overlay[data-position=center].bit-1jgz48w.bit-1jgz48w{align-items:center}.overlay[data-position=top].bit-1jgz48w.bit-1jgz48w{align-items:flex-start}.overlay[data-position=bottom].bit-1jgz48w.bit-1jgz48w{align-items:flex-end}.overlay.bit-1jgz48w .content.bit-1jgz48w{background-color:white;border-radius:var(--border-radius-base);padding:10px;min-width:480px}.overlay.bit-1jgz48w .header.bit-1jgz48w{display:flex;font-size:1.2rem;font-weight:500;align-items:center;justify-content:space-between;margin-bottom:0.8rem}.overlay.bit-1jgz48w .close-icon{cursor:pointer;color:rgba(0, 0, 0, 0.5)}.overlay.bit-1jgz48w .close-icon:hover{color:currentColor}");
 }
 const get_header_slot_changes = (dirty) => ({});
 const get_header_slot_context = (ctx) => ({});
-function create_fragment$1(ctx) {
+function create_fragment$2(ctx) {
   let div4;
   let div3;
   let div1;
@@ -9672,12 +10007,12 @@ function create_fragment$1(ctx) {
       div2 = element("div");
       if (default_slot)
         default_slot.c();
-      attr(div0, "class", "ellipsis bit-um98en");
-      attr(div1, "class", "header bit-um98en");
+      attr(div0, "class", "ellipsis bit-1jgz48w");
+      attr(div1, "class", "header bit-1jgz48w");
       set_style(div2, "height", "calc(100% - 60px)");
       set_style(div2, "overflow", "auto");
-      attr(div3, "class", "content bit-um98en");
-      attr(div4, "class", "overlay bit-um98en");
+      attr(div3, "class", "content bit-1jgz48w");
+      attr(div4, "class", "overlay bit-1jgz48w");
       attr(div4, "data-position", ctx[1]);
     },
     m(target, anchor) {
@@ -9749,7 +10084,7 @@ function create_fragment$1(ctx) {
     }
   };
 }
-function instance$1($$self, $$props, $$invalidate) {
+function instance$2($$self, $$props, $$invalidate) {
   let { $$slots: slots = {}, $$scope } = $$props;
   let { title = "" } = $$props;
   let { position = "top" } = $$props;
@@ -9792,93 +10127,189 @@ function instance$1($$self, $$props, $$invalidate) {
 class BookingModal extends SvelteComponent {
   constructor(options) {
     super();
-    init(this, options, instance$1, create_fragment$1, safe_not_equal, { title: 0, position: 1 }, add_css$1);
+    init(this, options, instance$2, create_fragment$2, safe_not_equal, { title: 0, position: 1 }, add_css$2);
   }
 }
-const subscriber_queue = [];
-function readable(value, start) {
+var PaymentBanner_svelte_svelte_type_style_lang = "";
+function add_css$1(target) {
+  append_styles(target, "bit-2lcrma", ".pay-banner-wrap.bit-2lcrma.bit-2lcrma{margin-bottom:10px}.pay-banner.bit-2lcrma.bit-2lcrma{display:flex;align-items:center;gap:12px;width:100%;box-sizing:border-box;padding:10px 16px;background-color:#ec9a3c;color:#fff;border-radius:var(--border-radius-base);cursor:pointer;font-size:14px;line-height:1.2;transition:background-color 0.15s ease}.pay-banner.bit-2lcrma+.pay-banner.bit-2lcrma{margin-top:8px}.pay-banner.bit-2lcrma.bit-2lcrma:hover{background-color:#e08c2c}.pay-banner__timer.bit-2lcrma.bit-2lcrma{flex:0 0 auto;font-weight:700;font-variant-numeric:tabular-nums;font-size:16px;padding:2px 8px;border-radius:6px;background-color:rgba(0, 0, 0, 0.12)}.pay-banner__text.bit-2lcrma.bit-2lcrma{flex:1 1 auto;font-weight:600;text-decoration:underline;text-underline-offset:2px}");
+}
+function get_each_context$1(ctx, list, i) {
+  const child_ctx = ctx.slice();
+  child_ctx[5] = list[i];
+  const constants_0 = remainingMs(child_ctx[5], child_ctx[1]);
+  child_ctx[6] = constants_0;
+  return child_ctx;
+}
+function create_if_block$1(ctx) {
+  let div;
+  let each_blocks = [];
+  let each_1_lookup = /* @__PURE__ */ new Map();
+  let each_value = ctx[0];
+  const get_key = (ctx2) => ctx2[5].guid;
+  for (let i = 0; i < each_value.length; i += 1) {
+    let child_ctx = get_each_context$1(ctx, each_value, i);
+    let key = get_key(child_ctx);
+    each_1_lookup.set(key, each_blocks[i] = create_each_block$1(key, child_ctx));
+  }
   return {
-    subscribe: writable(value, start).subscribe
+    c() {
+      div = element("div");
+      for (let i = 0; i < each_blocks.length; i += 1) {
+        each_blocks[i].c();
+      }
+      attr(div, "class", "pay-banner-wrap bit-2lcrma");
+    },
+    m(target, anchor) {
+      insert(target, div, anchor);
+      for (let i = 0; i < each_blocks.length; i += 1) {
+        each_blocks[i].m(div, null);
+      }
+    },
+    p(ctx2, dirty) {
+      if (dirty & 7) {
+        each_value = ctx2[0];
+        each_blocks = update_keyed_each(each_blocks, dirty, get_key, 1, ctx2, each_value, each_1_lookup, div, destroy_block, create_each_block$1, null, get_each_context$1);
+      }
+    },
+    d(detaching) {
+      if (detaching)
+        detach(div);
+      for (let i = 0; i < each_blocks.length; i += 1) {
+        each_blocks[i].d();
+      }
+    }
   };
 }
-function writable(value, start = noop) {
-  let stop;
-  const subscribers = /* @__PURE__ */ new Set();
-  function set2(new_value) {
-    if (safe_not_equal(value, new_value)) {
-      value = new_value;
-      if (stop) {
-        const run_queue = !subscriber_queue.length;
-        for (const subscriber of subscribers) {
-          subscriber[1]();
-          subscriber_queue.push(subscriber, value);
-        }
-        if (run_queue) {
-          for (let i = 0; i < subscriber_queue.length; i += 2) {
-            subscriber_queue[i][0](subscriber_queue[i + 1]);
-          }
-          subscriber_queue.length = 0;
-        }
+function create_each_block$1(key_1, ctx) {
+  let div;
+  let span0;
+  let t0_value = (ctx[6] > 0 ? fmt(ctx[6]) : "\u0412\u0440\u0435\u043C\u044F \u0438\u0441\u0442\u0435\u043A\u0430\u0435\u0442") + "";
+  let t0;
+  let t1;
+  let span1;
+  let t3;
+  let mounted;
+  let dispose;
+  function click_handler() {
+    return ctx[3](ctx[5]);
+  }
+  function keydown_handler(...args) {
+    return ctx[4](ctx[5], ...args);
+  }
+  return {
+    key: key_1,
+    first: null,
+    c() {
+      div = element("div");
+      span0 = element("span");
+      t0 = text(t0_value);
+      t1 = space();
+      span1 = element("span");
+      span1.textContent = "\u0423 \u0432\u0430\u0441 \u043D\u0435 \u043E\u043F\u043B\u0430\u0447\u0435\u043D\u0430 \u0431\u0440\u043E\u043D\u044C, \u043A\u043B\u0438\u043A\u043D\u0438\u0442\u0435, \u0447\u0442\u043E\u0431\u044B \u043F\u0435\u0440\u0435\u0439\u0442\u0438 \u043D\u0430 \u0441\u0442\u0440\u0430\u043D\u0438\u0446\u0443 \u043E\u043F\u043B\u0430\u0442\u044B";
+      t3 = space();
+      attr(span0, "class", "pay-banner__timer bit-2lcrma");
+      attr(span1, "class", "pay-banner__text bit-2lcrma");
+      attr(div, "class", "pay-banner bit-2lcrma");
+      attr(div, "role", "button");
+      attr(div, "tabindex", "0");
+      this.first = div;
+    },
+    m(target, anchor) {
+      insert(target, div, anchor);
+      append(div, span0);
+      append(span0, t0);
+      append(div, t1);
+      append(div, span1);
+      append(div, t3);
+      if (!mounted) {
+        dispose = [
+          listen(div, "click", click_handler),
+          listen(div, "keydown", keydown_handler)
+        ];
+        mounted = true;
       }
+    },
+    p(new_ctx, dirty) {
+      ctx = new_ctx;
+      if (dirty & 3 && t0_value !== (t0_value = (ctx[6] > 0 ? fmt(ctx[6]) : "\u0412\u0440\u0435\u043C\u044F \u0438\u0441\u0442\u0435\u043A\u0430\u0435\u0442") + ""))
+        set_data(t0, t0_value);
+    },
+    d(detaching) {
+      if (detaching)
+        detach(div);
+      mounted = false;
+      run_all(dispose);
     }
-  }
-  function update2(fn) {
-    set2(fn(value));
-  }
-  function subscribe2(run2, invalidate = noop) {
-    const subscriber = [run2, invalidate];
-    subscribers.add(subscriber);
-    if (subscribers.size === 1) {
-      stop = start(set2) || noop;
-    }
-    run2(value);
-    return () => {
-      subscribers.delete(subscriber);
-      if (subscribers.size === 0) {
-        stop();
-        stop = null;
-      }
-    };
-  }
-  return { set: set2, update: update2, subscribe: subscribe2 };
+  };
 }
-function derived(stores, fn, initial_value) {
-  const single = !Array.isArray(stores);
-  const stores_array = single ? [stores] : stores;
-  const auto = fn.length < 2;
-  return readable(initial_value, (set2) => {
-    let inited = false;
-    const values = [];
-    let pending = 0;
-    let cleanup = noop;
-    const sync = () => {
-      if (pending) {
-        return;
+function create_fragment$1(ctx) {
+  let if_block_anchor;
+  let if_block = ctx[0].length && create_if_block$1(ctx);
+  return {
+    c() {
+      if (if_block)
+        if_block.c();
+      if_block_anchor = empty();
+    },
+    m(target, anchor) {
+      if (if_block)
+        if_block.m(target, anchor);
+      insert(target, if_block_anchor, anchor);
+    },
+    p(ctx2, [dirty]) {
+      if (ctx2[0].length) {
+        if (if_block) {
+          if_block.p(ctx2, dirty);
+        } else {
+          if_block = create_if_block$1(ctx2);
+          if_block.c();
+          if_block.m(if_block_anchor.parentNode, if_block_anchor);
+        }
+      } else if (if_block) {
+        if_block.d(1);
+        if_block = null;
       }
-      cleanup();
-      const result = fn(single ? values[0] : values, set2);
-      if (auto) {
-        set2(result);
-      } else {
-        cleanup = is_function(result) ? result : noop;
-      }
-    };
-    const unsubscribers = stores_array.map((store, i) => subscribe(store, (value) => {
-      values[i] = value;
-      pending &= ~(1 << i);
-      if (inited) {
-        sync();
-      }
-    }, () => {
-      pending |= 1 << i;
-    }));
-    inited = true;
-    sync();
-    return function stop() {
-      run_all(unsubscribers);
-      cleanup();
-    };
-  });
+    },
+    i: noop,
+    o: noop,
+    d(detaching) {
+      if (if_block)
+        if_block.d(detaching);
+      if (detaching)
+        detach(if_block_anchor);
+    }
+  };
+}
+function remainingMs(p, nowTs) {
+  const ms = new Date(p.expired_at).getTime() - nowTs;
+  return ms > 0 ? ms : 0;
+}
+function fmt(ms) {
+  const total = Math.floor(ms / 1e3);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+function instance$1($$self, $$props, $$invalidate) {
+  let { items = [] } = $$props;
+  let { now = Date.now() } = $$props;
+  const dispatch2 = createEventDispatcher();
+  const click_handler = (p) => dispatch2("open", p);
+  const keydown_handler = (p, e) => (e.key === "Enter" || e.key === " ") && dispatch2("open", p);
+  $$self.$$set = ($$props2) => {
+    if ("items" in $$props2)
+      $$invalidate(0, items = $$props2.items);
+    if ("now" in $$props2)
+      $$invalidate(1, now = $$props2.now);
+  };
+  return [items, now, dispatch2, click_handler, keydown_handler];
+}
+class PaymentBanner extends SvelteComponent {
+  constructor(options) {
+    super();
+    init(this, options, instance$1, create_fragment$1, safe_not_equal, { items: 0, now: 1 }, add_css$1);
+  }
 }
 const isMobile = isMobileCheck();
 function isMobileCheck() {
@@ -9916,8 +10347,11 @@ function createSlotsStore() {
     const storeVal = {};
     const getNextDt = (l) => addMinutes(l, deltaHour * 60);
     let lastDt, nextDt, lastSlot;
+    const availableFrom = Date.now() + 5 * 60 * 1e3;
     slots.forEach((s) => {
-      const id = +new Date(s.dt);
+      const dt = new Date(s.dt);
+      const id = +dt;
+      s.is_available = s.is_available && id > availableFrom;
       if (lastDt && id >= nextDt) {
         lastDt = null;
       }
@@ -9977,6 +10411,7 @@ function selectedSlotsFromStore(storeSlots) {
         bookings[bookingIdx].fromToName = `\u0441 ${formatDate(bookings[bookingIdx].from, "HH:mm")} \u043F\u043E ${formatDate(bookings[bookingIdx].to, "HH:mm")}`;
       }
       const durationHours = (bookings[bookingIdx].to - bookings[bookingIdx].from) / (3600 * 1e3);
+      bookings[bookingIdx].durationHours = durationHours;
       bookings[bookingIdx].duration = formatDateDuration({
         hours: Math.floor(durationHours),
         minutes: (durationHours - Math.floor(durationHours)) * 60 || void 0
@@ -10001,51 +10436,195 @@ function selectedSlotsFromStore(storeSlots) {
     });
   });
 }
+const LS_KEY = "bit-ca-pending-payments";
+function paymentLinkUrl(postBookingUrl, orderGuid) {
+  return `${postBookingUrl.replace(/\/+$/, "")}/${orderGuid}/payment-link`;
+}
+function apiBaseFrom(postBookingUrl) {
+  return postBookingUrl.replace(/\/public\/orders\/?$/, "").replace(/\/+$/, "");
+}
+function paymentStatusUrl(postBookingUrl, guid) {
+  return `${apiBaseFrom(postBookingUrl)}/payment/${guid}`;
+}
+async function requestPaymentLink(url) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    mode: "cors"
+  });
+  if (res.status !== 200) {
+    return null;
+  }
+  return await res.json();
+}
+async function getPaymentStatus(url) {
+  const res = await fetch(url, { mode: "cors" });
+  let data = null;
+  try {
+    data = await res.json();
+  } catch {
+    data = null;
+  }
+  return { ok: res.ok, status: res.status, data };
+}
+function loadPending() {
+  if (typeof localStorage === "undefined") {
+    return [];
+  }
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    const list = raw ? JSON.parse(raw) : [];
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+function savePending(list) {
+  if (typeof localStorage === "undefined") {
+    return;
+  }
+  try {
+    if (list.length) {
+      localStorage.setItem(LS_KEY, JSON.stringify(list));
+    } else {
+      localStorage.removeItem(LS_KEY);
+    }
+  } catch {
+  }
+}
+const POLL_MS = 5e3;
+const TICK_MS = 1e3;
+function isTransientStatus(status) {
+  return status === 408 || status === 429 || status >= 500;
+}
+function createPaymentStore(opts = {}) {
+  const pending = writable(loadPending());
+  const now = writable(Date.now());
+  let pollTimer = null;
+  let tickTimer = null;
+  function persist(list) {
+    savePending(list);
+    pending.set(list);
+  }
+  function upsert(p) {
+    const list = get_store_value(pending).filter((x) => x.guid !== p.guid);
+    list.push(p);
+    persist(list);
+  }
+  function removeByGuid(guid) {
+    persist(get_store_value(pending).filter((p) => p.guid !== guid));
+    if (!get_store_value(pending).length) {
+      stop();
+    }
+  }
+  async function pollOnce() {
+    var _a;
+    for (const p of get_store_value(pending)) {
+      let res;
+      try {
+        res = await getPaymentStatus(p.statusUrl);
+      } catch {
+        continue;
+      }
+      if (isTransientStatus(res.status)) {
+        continue;
+      }
+      if (!res.ok) {
+        removeByGuid(p.guid);
+        continue;
+      }
+      const d = res.data;
+      const st = d == null ? void 0 : d.status;
+      if (st === "SUCCEEDED") {
+        removeByGuid(p.guid);
+        (_a = opts.onPaid) == null ? void 0 : _a.call(opts, p);
+      } else if (st === "CANCELED" || st === "REFUNDED") {
+        removeByGuid(p.guid);
+      } else if (d) {
+        upsert(__spreadProps(__spreadValues({}, p), { link: d.link, expired_at: d.expired_at, amount: d.amount }));
+      }
+    }
+  }
+  function start() {
+    if (!get_store_value(pending).length) {
+      return;
+    }
+    if (!pollTimer) {
+      pollOnce();
+      pollTimer = setInterval(pollOnce, POLL_MS);
+    }
+    if (!tickTimer) {
+      tickTimer = setInterval(() => now.set(Date.now()), TICK_MS);
+    }
+  }
+  function stop() {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    if (tickTimer) {
+      clearInterval(tickTimer);
+      tickTimer = null;
+    }
+  }
+  function addPending(p) {
+    upsert(p);
+    start();
+  }
+  function init2() {
+    now.set(Date.now());
+    start();
+  }
+  function dispose() {
+    stop();
+  }
+  return { pending, now, addPending, removeByGuid, init: init2, dispose };
+}
 var BookingCalendar_svelte_svelte_type_style_lang = "";
 function add_css(target) {
-  append_styles(target, "bit-78ux5", ':root{--bit-ca-bg:#fafafa;--bit-ca-bg2:#f5f5f5;--bit-ca-secondary-color:#999999;--bit-ca-secondary-color2:#767676;--bit-ca-border-color:#ddd;--bit-ca-accent-color:#5b21b6;--bit-ca-accent-lighter-color:#7c3aed}.calendar.bit-78ux5.bit-78ux5.bit-78ux5{font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen-Sans, Ubuntu, Cantarell, "Helvetica Neue", sans-serif;font-size:14px;width:var(--calendarWidth, 980px);margin:0 auto;padding:10px;background-color:var(--bit-ca-bg, #fafafa);position:relative;height:calc(100vh - 16px);overflow-y:auto;overflow-x:hidden;--sideWidth:60px}.calendar.bit-78ux5 .basket-panel__mobile-price.bit-78ux5.bit-78ux5{display:none}.calendar.mobile-view.bit-78ux5.bit-78ux5.bit-78ux5{padding:0;--sideWidth:40px}.calendar.mobile-view.bit-78ux5 .basket-panel.bit-78ux5.bit-78ux5{padding-left:0;padding-right:0;padding-bottom:16px;position:sticky;top:0}.calendar.mobile-view.bit-78ux5 .basket-panel .basket-panel__section-tabs.bit-78ux5.bit-78ux5{margin-bottom:8px}.calendar.mobile-view.bit-78ux5 .basket-panel .basket-panel__basket.bit-78ux5.bit-78ux5{display:none}.calendar.mobile-view.bit-78ux5 .calendar__header.bit-78ux5.bit-78ux5{position:sticky;top:99px;height:40px;padding-bottom:4px}.calendar.mobile-view.bit-78ux5 .calendar__row-slots .calendar__slot.bit-78ux5.bit-78ux5{padding:0 4px}.calendar.mobile-view.bit-78ux5 .basket-panel__mobile-price.bit-78ux5.bit-78ux5{display:flex;align-items:center;justify-content:center}.calendar.mobile-view.bit-78ux5 .btn--mobile-full.bit-78ux5.bit-78ux5{width:100%}.calendar.bit-78ux5 .basket-panel.bit-78ux5.bit-78ux5{background-color:var(--bit-ca-bg, #fafafa);padding:0 1rem 2rem 1rem}.calendar.bit-78ux5 .basket-panel__section-tabs.bit-78ux5.bit-78ux5{height:35px;display:flex;width:fit-content;margin-bottom:2rem}.calendar.bit-78ux5 .basket-panel__section-tab.bit-78ux5.bit-78ux5{height:35px;padding:0 0.5rem;display:flex;align-items:center;justify-content:center;background-color:white;border-radius:4px;margin-right:10px;border:1px solid transparent}.calendar.bit-78ux5 .basket-panel__section-tab.tab-active.bit-78ux5.bit-78ux5{background-color:var(--bit-ca-hover-slot-button-color, #ec4899);color:var(--bit-ca-accent-contrast-color, white);font-weight:500}.calendar.bit-78ux5 .basket-panel__section-tab.bit-78ux5.bit-78ux5:not(.tab-active){cursor:pointer;border:1px solid #eee}.calendar.bit-78ux5 .basket-panel__section-tab.bit-78ux5.bit-78ux5:not(.tab-active):hover{background-color:var(--bit-ca-hover-color, #ddd)}.calendar.bit-78ux5 .basket-panel__summary.bit-78ux5.bit-78ux5{height:fit-content;display:flex;justify-content:space-between;align-items:center}.calendar.bit-78ux5 .basket-panel__basket.bit-78ux5.bit-78ux5{display:flex;flex:1 1 auto;height:100%;min-height:120px}.calendar.bit-78ux5 .basket-panel__products.bit-78ux5.bit-78ux5{flex:1 1 auto;display:flex;flex-direction:column;justify-content:center;padding-right:8px}.calendar.bit-78ux5 .basket-panel__product.bit-78ux5.bit-78ux5{display:flex;padding:2px;background-color:white;margin-bottom:6px;border-radius:4px;border:1px solid #eee}.calendar.bit-78ux5 .basket-panel__product.bit-78ux5>div.bit-78ux5{padding:4px 12px}.calendar.bit-78ux5 .basket-panel__product.bit-78ux5>div.bit-78ux5:first-child{padding-left:8px}.calendar.bit-78ux5 .basket-panel__product-day.bit-78ux5.bit-78ux5{min-width:70px}.calendar.bit-78ux5 .basket-panel__product-amount.bit-78ux5.bit-78ux5{min-width:80px;text-align:right}.calendar.bit-78ux5 .basket-panel__product-duration.bit-78ux5.bit-78ux5{min-width:100px;text-align:right}.calendar.bit-78ux5 .basket-panel__product-actions.bit-78ux5.bit-78ux5{display:flex;align-items:center;margin-left:auto;color:var(--bit-ca-secondary-color, #999999)}.calendar.bit-78ux5 .basket-panel__product-actions.bit-78ux5.bit-78ux5:hover{color:currentColor;cursor:pointer}.calendar.bit-78ux5 .basket-panel__booking-btn.bit-78ux5>button.bit-78ux5{width:220px;height:40px;background-color:var(--bit-ca-accent-color, #5b21b6);color:white;font-weight:700;border:none;border-radius:4px;cursor:pointer}.calendar.bit-78ux5 .basket-panel__booking-btn.bit-78ux5>button.bit-78ux5:active{transform:scale(1.01)}.calendar.bit-78ux5 .basket-panel__booking-btn.bit-78ux5>button.bit-78ux5:disabled:active{transform:none}.calendar.bit-78ux5 .basket-panel__booking-btn.bit-78ux5>button.bit-78ux5:disabled{background-color:#a8a29e;cursor:not-allowed}.calendar.bit-78ux5 .basket-panel__total-price.bit-78ux5.bit-78ux5{display:flex;align-items:center;justify-content:center;border-left:1px solid #ccc;width:156px}.calendar.bit-78ux5 .basket-panel__total-price.bit-78ux5>span.bit-78ux5{padding:0 2rem;font-size:1.5rem}.calendar__header.bit-78ux5.bit-78ux5.bit-78ux5{background-color:var(--bit-ca-bg, #fafafa);display:flex;align-items:center}.calendar__day-nav.bit-78ux5.bit-78ux5.bit-78ux5{width:var(--sideWidth, 60px);display:flex;justify-content:center}.calendar__day-nav-right.bit-78ux5.bit-78ux5.bit-78ux5{text-align:right}.calendar__days.bit-78ux5.bit-78ux5.bit-78ux5{display:flex;align-items:center;flex:1 1 auto}.calendar__day.bit-78ux5.bit-78ux5.bit-78ux5{width:calc(100% / var(--viewDaysCount, 7));text-align:center}.calendar__day.weekend.bit-78ux5 .calendar__day-name.bit-78ux5.bit-78ux5,.calendar__day.weekend.bit-78ux5 .calendar__day-day.bit-78ux5.bit-78ux5{color:var(--bit-ca-weekend-day-color, rgb(167, 0, 0))}.calendar__rows.bit-78ux5.bit-78ux5.bit-78ux5{margin-top:8px}.calendar__row.bit-78ux5.bit-78ux5.bit-78ux5{display:flex;height:32px}.calendar__row.bit-78ux5:hover .calendar__row-hour.bit-78ux5.bit-78ux5{font-weight:700;color:var(--bit-ca-bold-color, rgb(70, 70, 70)) !important}.calendar__row.bit-78ux5:not(.zero-hour) .calendar__row-hour.bit-78ux5.bit-78ux5{color:var(--bit-ca-secondary-color, #999999);font-size:11px}.calendar__row-hour.bit-78ux5.bit-78ux5.bit-78ux5{width:var(--sideWidth, 60px);display:flex;align-items:center;justify-content:center}.calendar__row-slots.bit-78ux5.bit-78ux5.bit-78ux5{display:flex;align-items:center;flex:1 1 auto}.calendar__slot.bit-78ux5.bit-78ux5.bit-78ux5{width:calc(100% / var(--viewDaysCount, 7));display:flex;align-items:center;justify-content:center;padding:0 10px}.calendar__slot.bit-78ux5 .slot-btn.bit-78ux5.bit-78ux5{background-color:#fff;border:1px solid #bbb;width:100%;line-height:1.2rem;border-radius:4px;cursor:pointer;display:flex;align-items:center;justify-content:center}.calendar__slot.bit-78ux5 .slot-btn.bit-78ux5.bit-78ux5:hover{border-color:var(--bit-ca-hover-slot-button-border-color, #9d174d);background-color:var(--bit-ca-hover-slot-button-color, #ec4899);color:white}.calendar__slot.bit-78ux5 .slot-btn--selected.bit-78ux5.bit-78ux5{border-color:var(--bit-ca-hover-slot-button-border-color, #9d174d);background-color:var(--bit-ca-hover-slot-button-color, #ec4899);color:white}.calendar__slot.bit-78ux5 .slot-btn .slot-btn-icon{margin-right:0.3rem}.calendar__slot--busy.bit-78ux5.bit-78ux5.bit-78ux5{color:var(--bit-ca-secondary-color, #999999);font-size:12px}.calendar.bit-78ux5 .bold{font-weight:700;color:var(--bit-ca-bold-color, rgb(70, 70, 70))}.calendar.bit-78ux5 .h1{font-size:1.5rem;font-weight:500}.calendar.bit-78ux5 .h2{font-size:1.25rem;font-weight:500}.calendar.bit-78ux5 .h3{font-size:1.15rem;font-weight:500}.calendar.bit-78ux5 .rounded{border-radius:8px}.calendar.bit-78ux5 .pointer{cursor:pointer}.calendar.bit-78ux5 .hover:hover{background-color:var(--bit-ca-hover-color, #ddd)}.calendar.bit-78ux5 .inline-block{display:inline-block}.calendar.bit-78ux5 .btn-icon{display:inline-flex;border-radius:8px;cursor:pointer;padding:0.3rem;color:var(--bit-ca-secondary-color, #999999)}.calendar.bit-78ux5 .btn-icon:hover{background-color:var(--bit-ca-hover-color, #ddd);color:currentColor}.calendar.bit-78ux5 .btn-icon:active{transform:scale(1.1)}.calendar.bit-78ux5 .btn{padding:12px 20px;background-color:var(--bit-ca-accent-color);color:white;font-weight:700;border:none;border-radius:4px;cursor:pointer}.calendar.bit-78ux5 .btn:disabled{background-color:var(--bit-ca-accent-lighter-color)}.calendar.bit-78ux5 .flex{display:flex}.calendar.bit-78ux5 .flex.center{align-items:center;justify-content:center}.calendar.bit-78ux5 .flex-col{display:flex;flex-direction:column}.calendar.bit-78ux5 .flex-row{display:flex;flex-direction:row}.calendar.bit-78ux5 .items-end{align-items:flex-end}.calendar.bit-78ux5 .items-center{align-items:center}.calendar.bit-78ux5 .content-center{justify-content:center}.calendar.bit-78ux5 .content-end{justify-content:end;justify-content:flex-end}.calendar.bit-78ux5 .error{color:#f87171}.calendar.bit-78ux5 .success{color:#4ade80}');
+  append_styles(target, "bit-yolhwc", ':root{--bit-ca-bg:#fafafa;--bit-ca-bg2:#f5f5f5;--bit-ca-secondary-color:#999999;--bit-ca-secondary-color2:#767676;--bit-ca-border-color:#ddd;--bit-ca-accent-color:#13985f;--bit-ca-accent-lighter-color:#15b670c9;--border-radius-base:8px}.fg-primary{color:var(--bit-ca-accent-color)}.calendar.bit-yolhwc.bit-yolhwc.bit-yolhwc{font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen-Sans, Ubuntu, Cantarell, "Helvetica Neue", sans-serif;font-size:14px;width:var(--calendarWidth, 980px);margin:0 auto;padding:10px;background-color:var(--bit-ca-bg, #fafafa);position:relative;height:calc(100vh - 16px);overflow-y:auto;overflow-x:hidden;--sideWidth:60px}.calendar.bit-yolhwc .basket-panel__mobile-price.bit-yolhwc.bit-yolhwc{display:none}.calendar.mobile-view.bit-yolhwc.bit-yolhwc.bit-yolhwc{padding:0;--sideWidth:40px}.calendar.mobile-view.bit-yolhwc .basket-panel.bit-yolhwc.bit-yolhwc{padding-left:0;padding-right:0;padding-bottom:16px;position:sticky;top:0}.calendar.mobile-view.bit-yolhwc .basket-panel .basket-panel__section-tabs.bit-yolhwc.bit-yolhwc{margin-bottom:8px}.calendar.mobile-view.bit-yolhwc .basket-panel .basket-panel__basket.bit-yolhwc.bit-yolhwc{display:none}.calendar.mobile-view.bit-yolhwc .calendar__header.bit-yolhwc.bit-yolhwc{position:sticky;top:147px;height:40px;padding-bottom:4px}.calendar.mobile-view.bit-yolhwc .calendar__row-slots .calendar__slot.bit-yolhwc.bit-yolhwc{padding:0 4px}.calendar.mobile-view.bit-yolhwc .basket-panel__mobile-price.bit-yolhwc.bit-yolhwc{display:flex;align-items:center;justify-content:center}.calendar.mobile-view.bit-yolhwc .btn--mobile-full.bit-yolhwc.bit-yolhwc{width:100%}.calendar.mobile-view.bit-yolhwc .basket-panel__booking-btn.bit-yolhwc>button.bit-yolhwc{width:140px}.calendar.no-sections.bit-yolhwc .calendar__header.bit-yolhwc.bit-yolhwc{top:104px}.calendar.bit-yolhwc .basket-panel.bit-yolhwc.bit-yolhwc{background-color:var(--bit-ca-bg, #fafafa);padding:0 1rem 2rem 1rem}.calendar.bit-yolhwc .basket-panel__section-tabs.bit-yolhwc.bit-yolhwc{height:35px;display:flex;width:fit-content;margin-bottom:2rem}.calendar.bit-yolhwc .basket-panel__section-tab.bit-yolhwc.bit-yolhwc{height:35px;padding:0 0.5rem;display:flex;align-items:center;justify-content:center;background-color:white;border-radius:var(--border-radius-base);margin-right:10px;border:1px solid transparent}.calendar.bit-yolhwc .basket-panel__section-tab.tab-active.bit-yolhwc.bit-yolhwc{background-color:var(--bit-ca-hover-slot-button-color, #13985f);color:var(--bit-ca-accent-contrast-color, white);font-weight:500}.calendar.bit-yolhwc .basket-panel__section-tab.bit-yolhwc.bit-yolhwc:not(.tab-active){cursor:pointer;border:1px solid #eee}.calendar.bit-yolhwc .basket-panel__section-tab.bit-yolhwc.bit-yolhwc:not(.tab-active):hover{background-color:var(--bit-ca-hover-color, #ddd)}.calendar.bit-yolhwc .basket-panel__summary.bit-yolhwc.bit-yolhwc{height:fit-content;display:flex;justify-content:space-between;align-items:center}.calendar.bit-yolhwc .basket-panel__basket.bit-yolhwc.bit-yolhwc{display:flex;flex:1 1 auto;height:100%;min-height:120px}.calendar.bit-yolhwc .basket-panel__products.bit-yolhwc.bit-yolhwc{flex:1 1 auto;display:flex;flex-direction:column;justify-content:center;padding-right:8px}.calendar.bit-yolhwc .basket-panel__product.bit-yolhwc.bit-yolhwc{display:flex;padding:2px;background-color:white;margin-bottom:6px;border-radius:var(--border-radius-base);border:1px solid #eee}.calendar.bit-yolhwc .basket-panel__product.bit-yolhwc>div.bit-yolhwc{padding:4px 12px}.calendar.bit-yolhwc .basket-panel__product.bit-yolhwc>div.bit-yolhwc:first-child{padding-left:8px}.calendar.bit-yolhwc .basket-panel__product-day.bit-yolhwc.bit-yolhwc{min-width:70px}.calendar.bit-yolhwc .basket-panel__product-amount.bit-yolhwc.bit-yolhwc{min-width:80px;text-align:right}.calendar.bit-yolhwc .basket-panel__product-duration.bit-yolhwc.bit-yolhwc{min-width:100px;text-align:right}.calendar.bit-yolhwc .basket-panel__product-actions.bit-yolhwc.bit-yolhwc{display:flex;align-items:center;margin-left:auto;color:var(--bit-ca-secondary-color, #999999)}.calendar.bit-yolhwc .basket-panel__product-actions.bit-yolhwc.bit-yolhwc:hover{color:currentColor;cursor:pointer}.calendar.bit-yolhwc .basket-panel__booking-btn.bit-yolhwc>button.bit-yolhwc{width:220px;height:40px;background-color:var(--bit-ca-accent-color, #5b21b6);color:white;font-weight:700;border:none;border-radius:var(--border-radius-base);cursor:pointer}.calendar.bit-yolhwc .basket-panel__booking-btn.bit-yolhwc>button.bit-yolhwc:active{transform:scale(1.01)}.calendar.bit-yolhwc .basket-panel__booking-btn.bit-yolhwc>button.bit-yolhwc:disabled:active{transform:none}.calendar.bit-yolhwc .basket-panel__booking-btn.bit-yolhwc>button.bit-yolhwc:disabled{background-color:#a8a29e;cursor:not-allowed}.calendar.bit-yolhwc .basket-panel__total-price.bit-yolhwc.bit-yolhwc{display:flex;align-items:center;justify-content:center;border-left:1px solid #ccc;width:156px}.calendar.bit-yolhwc .basket-panel__total-price.bit-yolhwc>span.bit-yolhwc{padding:0 2rem;font-size:1.5rem}.calendar__header.bit-yolhwc.bit-yolhwc.bit-yolhwc{background-color:var(--bit-ca-bg, #fafafa);display:flex;align-items:center}.calendar__day-nav.bit-yolhwc.bit-yolhwc.bit-yolhwc{width:var(--sideWidth, 60px);display:flex;justify-content:center}.calendar__day-nav-right.bit-yolhwc.bit-yolhwc.bit-yolhwc{text-align:right}.calendar__days.bit-yolhwc.bit-yolhwc.bit-yolhwc{display:flex;align-items:center;flex:1 1 auto}.calendar__day.bit-yolhwc.bit-yolhwc.bit-yolhwc{width:calc(100% / var(--viewDaysCount, 7));text-align:center}.calendar__day.weekend.bit-yolhwc .calendar__day-name.bit-yolhwc.bit-yolhwc,.calendar__day.weekend.bit-yolhwc .calendar__day-day.bit-yolhwc.bit-yolhwc{color:var(--bit-ca-weekend-day-color, rgb(167, 0, 0))}.calendar__rows.bit-yolhwc.bit-yolhwc.bit-yolhwc{margin-top:8px}.calendar__row.bit-yolhwc.bit-yolhwc.bit-yolhwc{display:flex;height:32px}.calendar__row.bit-yolhwc:hover .calendar__row-hour.bit-yolhwc.bit-yolhwc{font-weight:700;color:var(--bit-ca-bold-color, rgb(70, 70, 70)) !important}.calendar__row.bit-yolhwc:not(.zero-hour) .calendar__row-hour.bit-yolhwc.bit-yolhwc{color:var(--bit-ca-secondary-color, #999999);font-size:11px}.calendar__row-hour.bit-yolhwc.bit-yolhwc.bit-yolhwc{width:var(--sideWidth, 60px);display:flex;align-items:center;justify-content:center}.calendar__row-slots.bit-yolhwc.bit-yolhwc.bit-yolhwc{display:flex;align-items:center;flex:1 1 auto}.calendar__slot.bit-yolhwc.bit-yolhwc.bit-yolhwc{width:calc(100% / var(--viewDaysCount, 7));display:flex;align-items:center;justify-content:center;padding:0 10px}.calendar__slot.bit-yolhwc .slot-btn.bit-yolhwc.bit-yolhwc{background-color:#fff;border:1px solid #bbb;width:100%;line-height:1.2rem;border-radius:var(--border-radius-base);cursor:pointer;display:flex;align-items:center;justify-content:center}.calendar__slot.bit-yolhwc .slot-btn.bit-yolhwc.bit-yolhwc:hover{border-color:var(--bit-ca-hover-slot-button-border-color, #108150);background-color:var(--bit-ca-hover-slot-button-color, #13985f);color:white}.calendar__slot.bit-yolhwc .slot-btn--selected.bit-yolhwc.bit-yolhwc{border-color:var(--bit-ca-hover-slot-button-border-color, #108150);background-color:var(--bit-ca-hover-slot-button-color, #13985f);color:white}.calendar__slot.bit-yolhwc .slot-btn .slot-btn-icon{margin-right:0.3rem}.calendar__slot--busy.bit-yolhwc.bit-yolhwc.bit-yolhwc{color:var(--bit-ca-secondary-color, #999999);font-size:12px}.calendar.bit-yolhwc .bold{font-weight:700;color:var(--bit-ca-bold-color, rgb(70, 70, 70))}.calendar.bit-yolhwc .h1{font-size:1.5rem;font-weight:500}.calendar.bit-yolhwc .h2{font-size:1.25rem;font-weight:500}.calendar.bit-yolhwc .h3{font-size:1.15rem;font-weight:500}.calendar.bit-yolhwc .rounded{border-radius:var(--border-radius-base)}.calendar.bit-yolhwc .pointer{cursor:pointer}.calendar.bit-yolhwc .hover:hover{background-color:var(--bit-ca-hover-color, #ddd)}.calendar.bit-yolhwc .inline-block{display:inline-block}.calendar.bit-yolhwc .btn-icon{display:inline-flex;border-radius:var(--border-radius-base);cursor:pointer;padding:0.3rem;color:var(--bit-ca-secondary-color, #999999)}.calendar.bit-yolhwc .btn-icon:hover{background-color:var(--bit-ca-hover-color, #ddd);color:currentColor}.calendar.bit-yolhwc .btn-icon:active{transform:scale(1.1)}.calendar.bit-yolhwc .btn{padding:12px 20px;background-color:var(--bit-ca-accent-color);color:white;font-weight:700;border:none;border-radius:var(--border-radius-base);cursor:pointer}.calendar.bit-yolhwc .btn:disabled{background-color:var(--bit-ca-accent-lighter-color)}.calendar.bit-yolhwc .flex{display:flex}.calendar.bit-yolhwc .flex.center{align-items:center;justify-content:center}.calendar.bit-yolhwc .flex-col{display:flex;flex-direction:column}.calendar.bit-yolhwc .flex-row{display:flex;flex-direction:row}.calendar.bit-yolhwc .items-end{align-items:flex-end}.calendar.bit-yolhwc .items-center{align-items:center}.calendar.bit-yolhwc .content-center{justify-content:center}.calendar.bit-yolhwc .content-end{justify-content:end;justify-content:flex-end}.calendar.bit-yolhwc .error{color:#f87171}.calendar.bit-yolhwc .success{color:#4ade80}');
 }
 function get_each_context(ctx, list, i) {
   const child_ctx = ctx.slice();
-  child_ctx[62] = list[i];
+  child_ctx[84] = list[i];
   return child_ctx;
 }
 function get_each_context_1(ctx, list, i) {
   const child_ctx = ctx.slice();
-  child_ctx[65] = list[i];
-  const constants_0 = child_ctx[23](child_ctx[65].date, child_ctx[62].hh, child_ctx[62].mm);
-  child_ctx[66] = constants_0;
-  const constants_1 = child_ctx[16][child_ctx[66]];
-  child_ctx[67] = constants_1;
+  child_ctx[87] = list[i];
+  const constants_0 = child_ctx[30](child_ctx[87].date, child_ctx[84].hh, child_ctx[84].mm);
+  child_ctx[88] = constants_0;
+  const constants_1 = child_ctx[21][child_ctx[88]];
+  child_ctx[89] = constants_1;
   return child_ctx;
 }
 function get_each_context_2(ctx, list, i) {
   const child_ctx = ctx.slice();
-  child_ctx[65] = list[i];
+  child_ctx[87] = list[i];
   return child_ctx;
 }
 function get_each_context_3(ctx, list, i) {
   const child_ctx = ctx.slice();
-  child_ctx[72] = list[i];
+  child_ctx[94] = list[i];
   return child_ctx;
 }
 function get_each_context_4(ctx, list, i) {
   const child_ctx = ctx.slice();
-  child_ctx[75] = list[i];
+  child_ctx[97] = list[i];
   return child_ctx;
 }
-function create_if_block_8(ctx) {
+function create_if_block_10(ctx) {
   let bookingmodal;
   let current;
   bookingmodal = new BookingModal({
     props: {
       title: "\u041E\u0444\u043E\u0440\u043C\u043B\u0435\u043D\u0438\u0435 \u0437\u0430\u043A\u0430\u0437\u0430",
-      $$slots: { default: [create_default_slot_2] },
+      $$slots: { default: [create_default_slot_4] },
       $$scope: { ctx }
     }
   });
-  bookingmodal.$on("close", ctx[37]);
-  bookingmodal.$on("overlayClick", ctx[38]);
+  bookingmodal.$on("close", ctx[49]);
+  bookingmodal.$on("overlayClick", ctx[50]);
   return {
     c() {
       create_component(bookingmodal.$$.fragment);
@@ -10056,7 +10635,7 @@ function create_if_block_8(ctx) {
     },
     p(ctx2, dirty) {
       const bookingmodal_changes = {};
-      if (dirty[0] & 22 | dirty[2] & 65536) {
+      if (dirty[0] & 22 | dirty[3] & 128) {
         bookingmodal_changes.$$scope = { dirty, ctx: ctx2 };
       }
       bookingmodal.$set(bookingmodal_changes);
@@ -10076,20 +10655,20 @@ function create_if_block_8(ctx) {
     }
   };
 }
-function create_default_slot_2(ctx) {
+function create_default_slot_4(ctx) {
   let bookingconfirm;
   let current;
   bookingconfirm = new BookingConfirm({
     props: {
-      selectedSlotsStore: ctx[18],
+      selectedSlotsStore: ctx[23],
       activeSection: ctx[4],
       placeName: ctx[1],
       placeAddress: ctx[2],
-      postBooking: ctx[20]
+      postBooking: ctx[27]
     }
   });
-  bookingconfirm.$on("ok", ctx[26]);
-  bookingconfirm.$on("error", ctx[27]);
+  bookingconfirm.$on("ok", ctx[33]);
+  bookingconfirm.$on("error", ctx[34]);
   return {
     c() {
       create_component(bookingconfirm.$$.fragment);
@@ -10123,18 +10702,18 @@ function create_default_slot_2(ctx) {
     }
   };
 }
-function create_if_block_7(ctx) {
+function create_if_block_9(ctx) {
   let bookingmodal;
   let current;
   bookingmodal = new BookingModal({
     props: {
       title: "\u041F\u043E\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043D\u0438\u0435",
-      $$slots: { default: [create_default_slot_1] },
+      $$slots: { default: [create_default_slot_3] },
       $$scope: { ctx }
     }
   });
-  bookingmodal.$on("close", ctx[40]);
-  bookingmodal.$on("overlayClick", ctx[41]);
+  bookingmodal.$on("close", ctx[52]);
+  bookingmodal.$on("overlayClick", ctx[53]);
   return {
     c() {
       create_component(bookingmodal.$$.fragment);
@@ -10145,7 +10724,239 @@ function create_if_block_7(ctx) {
     },
     p(ctx2, dirty) {
       const bookingmodal_changes = {};
-      if (dirty[0] & 128 | dirty[2] & 65536) {
+      if (dirty[0] & 128 | dirty[3] & 128) {
+        bookingmodal_changes.$$scope = { dirty, ctx: ctx2 };
+      }
+      bookingmodal.$set(bookingmodal_changes);
+    },
+    i(local) {
+      if (current)
+        return;
+      transition_in(bookingmodal.$$.fragment, local);
+      current = true;
+    },
+    o(local) {
+      transition_out(bookingmodal.$$.fragment, local);
+      current = false;
+    },
+    d(detaching) {
+      destroy_component(bookingmodal, detaching);
+    }
+  };
+}
+function create_default_slot_3(ctx) {
+  let div1;
+  let icon;
+  let t0;
+  let div0;
+  let t2;
+  let div2;
+  let button;
+  let current;
+  let mounted;
+  let dispose;
+  icon = new Icon({
+    props: {
+      name: "clipboard-check",
+      size: "2rem",
+      class: "success"
+    }
+  });
+  return {
+    c() {
+      div1 = element("div");
+      create_component(icon.$$.fragment);
+      t0 = space();
+      div0 = element("div");
+      div0.textContent = "\u0411\u0440\u043E\u043D\u0438\u0440\u043E\u0432\u0430\u043D\u0438\u0435 \u0443\u0441\u043F\u0435\u0448\u043D\u043E.";
+      t2 = space();
+      div2 = element("div");
+      button = element("button");
+      button.textContent = "\u041E\u041A";
+      attr(div1, "class", "flex-row items-center");
+      set_style(div1, "margin-top", "1rem");
+      attr(button, "type", "button");
+      attr(button, "class", "btn btn--mobile-full bit-yolhwc");
+      attr(div2, "class", "flex-row content-end");
+      set_style(div2, "margin-top", "2rem");
+    },
+    m(target, anchor) {
+      insert(target, div1, anchor);
+      mount_component(icon, div1, null);
+      append(div1, t0);
+      append(div1, div0);
+      insert(target, t2, anchor);
+      insert(target, div2, anchor);
+      append(div2, button);
+      current = true;
+      if (!mounted) {
+        dispose = listen(button, "click", ctx[51]);
+        mounted = true;
+      }
+    },
+    p: noop,
+    i(local) {
+      if (current)
+        return;
+      transition_in(icon.$$.fragment, local);
+      current = true;
+    },
+    o(local) {
+      transition_out(icon.$$.fragment, local);
+      current = false;
+    },
+    d(detaching) {
+      if (detaching)
+        detach(div1);
+      destroy_component(icon);
+      if (detaching)
+        detach(t2);
+      if (detaching)
+        detach(div2);
+      mounted = false;
+      dispose();
+    }
+  };
+}
+function create_if_block_8(ctx) {
+  let bookingmodal;
+  let current;
+  bookingmodal = new BookingModal({
+    props: {
+      title: "\u041E\u0436\u0438\u0434\u0430\u0435\u0442\u0441\u044F \u043E\u043F\u043B\u0430\u0442\u0430",
+      $$slots: { default: [create_default_slot_2] },
+      $$scope: { ctx }
+    }
+  });
+  bookingmodal.$on("close", ctx[55]);
+  bookingmodal.$on("overlayClick", ctx[56]);
+  return {
+    c() {
+      create_component(bookingmodal.$$.fragment);
+    },
+    m(target, anchor) {
+      mount_component(bookingmodal, target, anchor);
+      current = true;
+    },
+    p(ctx2, dirty) {
+      const bookingmodal_changes = {};
+      if (dirty[0] & 1050624 | dirty[3] & 128) {
+        bookingmodal_changes.$$scope = { dirty, ctx: ctx2 };
+      }
+      bookingmodal.$set(bookingmodal_changes);
+    },
+    i(local) {
+      if (current)
+        return;
+      transition_in(bookingmodal.$$.fragment, local);
+      current = true;
+    },
+    o(local) {
+      transition_out(bookingmodal.$$.fragment, local);
+      current = false;
+    },
+    d(detaching) {
+      destroy_component(bookingmodal, detaching);
+    }
+  };
+}
+function create_default_slot_2(ctx) {
+  let div2;
+  let div0;
+  let t0;
+  let span;
+  let t1_value = paymentRemainingText(ctx[11], ctx[20]) + "";
+  let t1;
+  let t2;
+  let t3;
+  let div1;
+  let t5;
+  let div3;
+  let button;
+  let mounted;
+  let dispose;
+  return {
+    c() {
+      div2 = element("div");
+      div0 = element("div");
+      t0 = text("\u0411\u0440\u043E\u043D\u044C \u0441\u043E\u0437\u0434\u0430\u043D\u0430. \u041E\u0441\u0442\u0430\u043B\u043E\u0441\u044C \u043E\u043F\u043B\u0430\u0442\u0438\u0442\u044C \u0432 \u0442\u0435\u0447\u0435\u043D\u0438\u0435\r\n					");
+      span = element("span");
+      t1 = text(t1_value);
+      t2 = text(".");
+      t3 = space();
+      div1 = element("div");
+      div1.textContent = "\u041F\u043E\u0441\u043B\u0435 \u043E\u043F\u043B\u0430\u0442\u044B \u0432 \u043E\u0442\u043A\u0440\u044B\u0432\u0448\u0435\u0439\u0441\u044F \u0432\u043A\u043B\u0430\u0434\u043A\u0435 \u044D\u0442\u043E \u043E\u043A\u043D\u043E \u043E\u0431\u043D\u043E\u0432\u0438\u0442\u0441\u044F \u0430\u0432\u0442\u043E\u043C\u0430\u0442\u0438\u0447\u0435\u0441\u043A\u0438.";
+      t5 = space();
+      div3 = element("div");
+      button = element("button");
+      button.textContent = "\u041F\u0435\u0440\u0435\u0439\u0442\u0438 \u043A \u043E\u043F\u043B\u0430\u0442\u0435";
+      attr(span, "class", "fg-primary");
+      set_style(span, "font-weight", "700");
+      set_style(div1, "margin-top", "0.5rem");
+      set_style(div1, "color", "var(--bit-ca-secondary-color2)");
+      set_style(div2, "margin-top", "1rem");
+      attr(button, "type", "button");
+      attr(button, "class", "btn btn--mobile-full bit-yolhwc");
+      attr(div3, "class", "flex-row content-end");
+      set_style(div3, "margin-top", "2rem");
+      set_style(div3, "gap", "10px");
+    },
+    m(target, anchor) {
+      insert(target, div2, anchor);
+      append(div2, div0);
+      append(div0, t0);
+      append(div0, span);
+      append(span, t1);
+      append(div0, t2);
+      append(div2, t3);
+      append(div2, div1);
+      insert(target, t5, anchor);
+      insert(target, div3, anchor);
+      append(div3, button);
+      if (!mounted) {
+        dispose = listen(button, "click", ctx[54]);
+        mounted = true;
+      }
+    },
+    p(ctx2, dirty) {
+      if (dirty[0] & 1050624 && t1_value !== (t1_value = paymentRemainingText(ctx2[11], ctx2[20]) + ""))
+        set_data(t1, t1_value);
+    },
+    d(detaching) {
+      if (detaching)
+        detach(div2);
+      if (detaching)
+        detach(t5);
+      if (detaching)
+        detach(div3);
+      mounted = false;
+      dispose();
+    }
+  };
+}
+function create_if_block_7(ctx) {
+  let bookingmodal;
+  let current;
+  bookingmodal = new BookingModal({
+    props: {
+      title: "\u041E\u043F\u043B\u0430\u0442\u0430 \u043F\u043E\u043B\u0443\u0447\u0435\u043D\u0430",
+      $$slots: { default: [create_default_slot_1] },
+      $$scope: { ctx }
+    }
+  });
+  bookingmodal.$on("close", ctx[58]);
+  bookingmodal.$on("overlayClick", ctx[59]);
+  return {
+    c() {
+      create_component(bookingmodal.$$.fragment);
+    },
+    m(target, anchor) {
+      mount_component(bookingmodal, target, anchor);
+      current = true;
+    },
+    p(ctx2, dirty) {
+      const bookingmodal_changes = {};
+      if (dirty[0] & 1024 | dirty[3] & 128) {
         bookingmodal_changes.$$scope = { dirty, ctx: ctx2 };
       }
       bookingmodal.$set(bookingmodal_changes);
@@ -10189,15 +11000,16 @@ function create_default_slot_1(ctx) {
       create_component(icon.$$.fragment);
       t0 = space();
       div0 = element("div");
-      div0.textContent = "\u0411\u0440\u043E\u043D\u0438\u0440\u043E\u0432\u0430\u043D\u0438\u0435 \u0443\u0441\u043F\u0435\u0448\u043D\u043E.";
+      div0.textContent = "\u041E\u043F\u043B\u0430\u0442\u0430 \u043F\u043E\u043B\u0443\u0447\u0435\u043D\u0430, \u0431\u0440\u043E\u043D\u044C \u043F\u043E\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043D\u0430.";
       t2 = space();
       div2 = element("div");
       button = element("button");
       button.textContent = "\u041E\u041A";
+      set_style(div0, "margin-left", "0.5rem");
       attr(div1, "class", "flex-row items-center");
       set_style(div1, "margin-top", "1rem");
       attr(button, "type", "button");
-      attr(button, "class", "btn btn--mobile-full bit-78ux5");
+      attr(button, "class", "btn btn--mobile-full bit-yolhwc");
       attr(div2, "class", "flex-row content-end");
       set_style(div2, "margin-top", "2rem");
     },
@@ -10211,7 +11023,7 @@ function create_default_slot_1(ctx) {
       append(div2, button);
       current = true;
       if (!mounted) {
-        dispose = listen(button, "click", ctx[39]);
+        dispose = listen(button, "click", ctx[57]);
         mounted = true;
       }
     },
@@ -10249,8 +11061,8 @@ function create_if_block_6(ctx) {
       $$scope: { ctx }
     }
   });
-  bookingmodal.$on("close", ctx[43]);
-  bookingmodal.$on("overlayClick", ctx[44]);
+  bookingmodal.$on("close", ctx[61]);
+  bookingmodal.$on("overlayClick", ctx[62]);
   return {
     c() {
       create_component(bookingmodal.$$.fragment);
@@ -10261,7 +11073,7 @@ function create_if_block_6(ctx) {
     },
     p(ctx2, dirty) {
       const bookingmodal_changes = {};
-      if (dirty[0] & 256 | dirty[2] & 65536) {
+      if (dirty[0] & 256 | dirty[3] & 128) {
         bookingmodal_changes.$$scope = { dirty, ctx: ctx2 };
       }
       bookingmodal.$set(bookingmodal_changes);
@@ -10314,7 +11126,7 @@ function create_default_slot(ctx) {
       attr(div1, "class", "flex-row items-center");
       set_style(div1, "margin-top", "1rem");
       attr(button, "type", "button");
-      attr(button, "class", "btn btn--mobile-full bit-78ux5");
+      attr(button, "class", "btn btn--mobile-full bit-yolhwc");
       attr(div2, "class", "flex-row content-end");
       set_style(div2, "margin-top", "2rem");
     },
@@ -10328,7 +11140,7 @@ function create_default_slot(ctx) {
       append(div2, button);
       current = true;
       if (!mounted) {
-        dispose = listen(button, "click", ctx[42]);
+        dispose = listen(button, "click", ctx[60]);
         mounted = true;
       }
     },
@@ -10369,7 +11181,7 @@ function create_if_block_5(ctx) {
       for (let i = 0; i < each_blocks.length; i += 1) {
         each_blocks[i].c();
       }
-      attr(div, "class", "basket-panel__section-tabs bit-78ux5");
+      attr(div, "class", "basket-panel__section-tabs bit-yolhwc");
     },
     m(target, anchor) {
       insert(target, div, anchor);
@@ -10378,7 +11190,7 @@ function create_if_block_5(ctx) {
       }
     },
     p(ctx2, dirty) {
-      if (dirty[0] & 2097200) {
+      if (dirty[0] & 268435504) {
         each_value_4 = ctx2[5];
         let i;
         for (i = 0; i < each_value_4.length; i += 1) {
@@ -10406,37 +11218,37 @@ function create_if_block_5(ctx) {
 }
 function create_each_block_4(ctx) {
   let div;
-  let t0_value = ctx[75].name + "";
+  let t0_value = ctx[97].name + "";
   let t0;
   let t1;
   let mounted;
   let dispose;
-  function click_handler_2() {
-    return ctx[45](ctx[75]);
+  function click_handler_4() {
+    return ctx[63](ctx[97]);
   }
   return {
     c() {
       div = element("div");
       t0 = text(t0_value);
       t1 = space();
-      attr(div, "class", "basket-panel__section-tab bit-78ux5");
-      toggle_class(div, "tab-active", ctx[4] === ctx[75]);
+      attr(div, "class", "basket-panel__section-tab bit-yolhwc");
+      toggle_class(div, "tab-active", ctx[4] === ctx[97]);
     },
     m(target, anchor) {
       insert(target, div, anchor);
       append(div, t0);
       append(div, t1);
       if (!mounted) {
-        dispose = listen(div, "click", click_handler_2);
+        dispose = listen(div, "click", click_handler_4);
         mounted = true;
       }
     },
     p(new_ctx, dirty) {
       ctx = new_ctx;
-      if (dirty[0] & 32 && t0_value !== (t0_value = ctx[75].name + ""))
+      if (dirty[0] & 32 && t0_value !== (t0_value = ctx[97].name + ""))
         set_data(t0, t0_value);
       if (dirty[0] & 48) {
-        toggle_class(div, "tab-active", ctx[4] === ctx[75]);
+        toggle_class(div, "tab-active", ctx[4] === ctx[97]);
       }
     },
     d(detaching) {
@@ -10450,15 +11262,15 @@ function create_each_block_4(ctx) {
 function create_each_block_3(ctx) {
   let div5;
   let div0;
-  let t0_value = ctx[72].day + "";
+  let t0_value = ctx[94].day + "";
   let t0;
   let t1;
   let div1;
-  let t2_value = ctx[72].fromToName + "";
+  let t2_value = ctx[94].fromToName + "";
   let t2;
   let t3;
   let div2;
-  let t4_value = ctx[72].duration + "";
+  let t4_value = ctx[94].duration + "";
   let t4;
   let t5;
   let div3;
@@ -10469,13 +11281,13 @@ function create_each_block_3(ctx) {
   let current;
   let mounted;
   let dispose;
-  function click_handler_3() {
-    return ctx[46](ctx[72]);
+  function click_handler_5() {
+    return ctx[64](ctx[94]);
   }
   icon = new Icon({
     props: { name: "x-circle", size: "1.2rem" }
   });
-  icon.$on("click", click_handler_3);
+  icon.$on("click", click_handler_5);
   return {
     c() {
       div5 = element("div");
@@ -10492,12 +11304,12 @@ function create_each_block_3(ctx) {
       t6 = space();
       div4 = element("div");
       create_component(icon.$$.fragment);
-      attr(div0, "class", "basket-panel__product-day bit-78ux5");
-      attr(div1, "class", "basket-panel__product-time bit-78ux5");
-      attr(div2, "class", "basket-panel__product-duration bit-78ux5");
-      attr(div3, "class", "basket-panel__product-amount bit-78ux5");
-      attr(div4, "class", "basket-panel__product-actions bit-78ux5");
-      attr(div5, "class", "basket-panel__product bit-78ux5");
+      attr(div0, "class", "basket-panel__product-day bit-yolhwc");
+      attr(div1, "class", "basket-panel__product-time bit-yolhwc");
+      attr(div2, "class", "basket-panel__product-duration bit-yolhwc");
+      attr(div3, "class", "basket-panel__product-amount bit-yolhwc");
+      attr(div4, "class", "basket-panel__product-actions bit-yolhwc");
+      attr(div5, "class", "basket-panel__product bit-yolhwc");
     },
     m(target, anchor) {
       insert(target, div5, anchor);
@@ -10516,20 +11328,20 @@ function create_each_block_3(ctx) {
       mount_component(icon, div4, null);
       current = true;
       if (!mounted) {
-        dispose = action_destroyer(fmtCurrency_action = fmtCurrency.call(null, div3, ctx[72].amount));
+        dispose = action_destroyer(fmtCurrency_action = fmtCurrency.call(null, div3, ctx[94].amount));
         mounted = true;
       }
     },
     p(new_ctx, dirty) {
       ctx = new_ctx;
-      if ((!current || dirty[0] & 32768) && t0_value !== (t0_value = ctx[72].day + ""))
+      if ((!current || dirty[0] & 262144) && t0_value !== (t0_value = ctx[94].day + ""))
         set_data(t0, t0_value);
-      if ((!current || dirty[0] & 32768) && t2_value !== (t2_value = ctx[72].fromToName + ""))
+      if ((!current || dirty[0] & 262144) && t2_value !== (t2_value = ctx[94].fromToName + ""))
         set_data(t2, t2_value);
-      if ((!current || dirty[0] & 32768) && t4_value !== (t4_value = ctx[72].duration + ""))
+      if ((!current || dirty[0] & 262144) && t4_value !== (t4_value = ctx[94].duration + ""))
         set_data(t4, t4_value);
-      if (fmtCurrency_action && is_function(fmtCurrency_action.update) && dirty[0] & 32768)
-        fmtCurrency_action.update.call(null, ctx[72].amount);
+      if (fmtCurrency_action && is_function(fmtCurrency_action.update) && dirty[0] & 262144)
+        fmtCurrency_action.update.call(null, ctx[94].amount);
     },
     i(local) {
       if (current)
@@ -10584,7 +11396,7 @@ function create_if_block_3(ctx) {
       mount_component(icon, div, null);
       current = true;
       if (!mounted) {
-        dispose = listen(div, "click", ctx[25]);
+        dispose = listen(div, "click", ctx[32]);
         mounted = true;
       }
     },
@@ -10611,11 +11423,11 @@ function create_if_block_3(ctx) {
 function create_each_block_2(ctx) {
   let div2;
   let div0;
-  let t0_value = ctx[65].name + "";
+  let t0_value = ctx[87].name + "";
   let t0;
   let t1;
   let div1;
-  let t2_value = ctx[65].day + "";
+  let t2_value = ctx[87].day + "";
   let t2;
   let t3;
   return {
@@ -10627,10 +11439,10 @@ function create_each_block_2(ctx) {
       div1 = element("div");
       t2 = text(t2_value);
       t3 = space();
-      attr(div0, "class", "calendar__day-name bold bit-78ux5");
-      attr(div1, "class", "calendar__day-day bit-78ux5");
-      attr(div2, "class", "calendar__day bit-78ux5");
-      toggle_class(div2, "weekend", ctx[65].weekend);
+      attr(div0, "class", "calendar__day-name bold bit-yolhwc");
+      attr(div1, "class", "calendar__day-day bit-yolhwc");
+      attr(div2, "class", "calendar__day bit-yolhwc");
+      toggle_class(div2, "weekend", ctx[87].weekend);
     },
     m(target, anchor) {
       insert(target, div2, anchor);
@@ -10642,12 +11454,12 @@ function create_each_block_2(ctx) {
       append(div2, t3);
     },
     p(ctx2, dirty) {
-      if (dirty[0] & 8 && t0_value !== (t0_value = ctx2[65].name + ""))
+      if (dirty[0] & 8 && t0_value !== (t0_value = ctx2[87].name + ""))
         set_data(t0, t0_value);
-      if (dirty[0] & 8 && t2_value !== (t2_value = ctx2[65].day + ""))
+      if (dirty[0] & 8 && t2_value !== (t2_value = ctx2[87].day + ""))
         set_data(t2, t2_value);
       if (dirty[0] & 8) {
-        toggle_class(div2, "weekend", ctx2[65].weekend);
+        toggle_class(div2, "weekend", ctx2[87].weekend);
       }
     },
     d(detaching) {
@@ -10664,7 +11476,7 @@ function create_if_block(ctx) {
   const if_block_creators = [create_if_block_1, create_else_block];
   const if_blocks = [];
   function select_block_type(ctx2, dirty) {
-    if (ctx2[67].is_available)
+    if (ctx2[89].is_available)
       return 0;
     return 1;
   }
@@ -10731,21 +11543,21 @@ function create_else_block(ctx) {
       div = element("div");
       span = element("span");
       t = space();
-      attr(div, "class", "calendar__slot calendar__slot--busy bit-78ux5");
+      attr(div, "class", "calendar__slot calendar__slot--busy bit-yolhwc");
     },
     m(target, anchor) {
       insert(target, div, anchor);
       append(div, span);
       append(div, t);
       if (!mounted) {
-        dispose = action_destroyer(fmtCurrency_action = fmtCurrency.call(null, span, ctx[67].amount));
+        dispose = action_destroyer(fmtCurrency_action = fmtCurrency.call(null, span, ctx[89].amount));
         mounted = true;
       }
     },
     p(new_ctx, dirty) {
       ctx = new_ctx;
-      if (fmtCurrency_action && is_function(fmtCurrency_action.update) && dirty[0] & 81928)
-        fmtCurrency_action.update.call(null, ctx[67].amount);
+      if (fmtCurrency_action && is_function(fmtCurrency_action.update) && dirty[0] & 2228232)
+        fmtCurrency_action.update.call(null, ctx[89].amount);
     },
     i: noop,
     o: noop,
@@ -10767,9 +11579,9 @@ function create_if_block_1(ctx) {
   let current;
   let mounted;
   let dispose;
-  let if_block = ctx[67].selected && create_if_block_2();
-  function click_handler_5() {
-    return ctx[48](ctx[67]);
+  let if_block = ctx[89].selected && create_if_block_2();
+  function click_handler_6() {
+    return ctx[65](ctx[89]);
   }
   return {
     c() {
@@ -10781,9 +11593,9 @@ function create_if_block_1(ctx) {
       span = element("span");
       t1 = space();
       attr(button, "type", "button");
-      attr(button, "class", "slot-btn bit-78ux5");
-      toggle_class(button, "slot-btn--selected", ctx[67].selected);
-      attr(div, "class", "calendar__slot bit-78ux5");
+      attr(button, "class", "slot-btn bit-yolhwc");
+      toggle_class(button, "slot-btn--selected", ctx[89].selected);
+      attr(div, "class", "calendar__slot bit-yolhwc");
     },
     m(target, anchor) {
       insert(target, div, anchor);
@@ -10796,17 +11608,17 @@ function create_if_block_1(ctx) {
       current = true;
       if (!mounted) {
         dispose = [
-          action_destroyer(fmtCurrency_action = fmtCurrency.call(null, span, ctx[67].amount)),
-          listen(button, "click", click_handler_5)
+          action_destroyer(fmtCurrency_action = fmtCurrency.call(null, span, ctx[89].amount)),
+          listen(button, "click", click_handler_6)
         ];
         mounted = true;
       }
     },
     p(new_ctx, dirty) {
       ctx = new_ctx;
-      if (ctx[67].selected) {
+      if (ctx[89].selected) {
         if (if_block) {
-          if (dirty[0] & 81928) {
+          if (dirty[0] & 2228232) {
             transition_in(if_block, 1);
           }
         } else {
@@ -10822,10 +11634,10 @@ function create_if_block_1(ctx) {
         });
         check_outros();
       }
-      if (fmtCurrency_action && is_function(fmtCurrency_action.update) && dirty[0] & 81928)
-        fmtCurrency_action.update.call(null, ctx[67].amount);
-      if (dirty[0] & 8470536) {
-        toggle_class(button, "slot-btn--selected", ctx[67].selected);
+      if (fmtCurrency_action && is_function(fmtCurrency_action.update) && dirty[0] & 2228232)
+        fmtCurrency_action.update.call(null, ctx[89].amount);
+      if (dirty[0] & 1075970056) {
+        toggle_class(button, "slot-btn--selected", ctx[89].selected);
       }
     },
     i(local) {
@@ -10886,7 +11698,7 @@ function create_if_block_2(ctx) {
 function create_each_block_1(ctx) {
   let if_block_anchor;
   let current;
-  let if_block = ctx[67] && create_if_block(ctx);
+  let if_block = ctx[89] && create_if_block(ctx);
   return {
     c() {
       if (if_block)
@@ -10900,10 +11712,10 @@ function create_each_block_1(ctx) {
       current = true;
     },
     p(ctx2, dirty) {
-      if (ctx2[67]) {
+      if (ctx2[89]) {
         if (if_block) {
           if_block.p(ctx2, dirty);
-          if (dirty[0] & 81928) {
+          if (dirty[0] & 2228232) {
             transition_in(if_block, 1);
           }
         } else {
@@ -10941,13 +11753,13 @@ function create_each_block_1(ctx) {
 function create_each_block(ctx) {
   let div3;
   let div0;
-  let t0_value = ctx[62].displayHour + "";
+  let t0_value = ctx[84].displayHour + "";
   let t0;
   let t1;
   let div1;
   let t2;
   let div2;
-  let t3_value = ctx[62].displayHour + "";
+  let t3_value = ctx[84].displayHour + "";
   let t3;
   let t4;
   let current;
@@ -10973,11 +11785,11 @@ function create_each_block(ctx) {
       div2 = element("div");
       t3 = text(t3_value);
       t4 = space();
-      attr(div0, "class", "calendar__row-hour calendar__row-hour-left bit-78ux5");
-      attr(div1, "class", "calendar__row-slots bit-78ux5");
-      attr(div2, "class", "calendar__row-hour calendar__row-hour-right bit-78ux5");
-      attr(div3, "class", "calendar__row bit-78ux5");
-      toggle_class(div3, "zero-hour", ctx[62].zero);
+      attr(div0, "class", "calendar__row-hour calendar__row-hour-left bit-yolhwc");
+      attr(div1, "class", "calendar__row-slots bit-yolhwc");
+      attr(div2, "class", "calendar__row-hour calendar__row-hour-right bit-yolhwc");
+      attr(div3, "class", "calendar__row bit-yolhwc");
+      toggle_class(div3, "zero-hour", ctx[84].zero);
     },
     m(target, anchor) {
       insert(target, div3, anchor);
@@ -10995,9 +11807,9 @@ function create_each_block(ctx) {
       current = true;
     },
     p(ctx2, dirty) {
-      if ((!current || dirty[0] & 16384) && t0_value !== (t0_value = ctx2[62].displayHour + ""))
+      if ((!current || dirty[0] & 131072) && t0_value !== (t0_value = ctx2[84].displayHour + ""))
         set_data(t0, t0_value);
-      if (dirty[0] & 8994824) {
+      if (dirty[0] & 1143078920) {
         each_value_1 = ctx2[3];
         let i;
         for (i = 0; i < each_value_1.length; i += 1) {
@@ -11018,10 +11830,10 @@ function create_each_block(ctx) {
         }
         check_outros();
       }
-      if ((!current || dirty[0] & 16384) && t3_value !== (t3_value = ctx2[62].displayHour + ""))
+      if ((!current || dirty[0] & 131072) && t3_value !== (t3_value = ctx2[84].displayHour + ""))
         set_data(t3, t3_value);
-      if (dirty[0] & 16384) {
-        toggle_class(div3, "zero-hour", ctx2[62].zero);
+      if (dirty[0] & 131072) {
+        toggle_class(div3, "zero-hour", ctx2[84].zero);
       }
     },
     i(local) {
@@ -11047,49 +11859,69 @@ function create_each_block(ctx) {
   };
 }
 function create_fragment(ctx) {
-  let div14;
+  let div15;
+  let paymentbanner;
   let t0;
   let t1;
   let t2;
-  let div7;
   let t3;
-  let div6;
-  let div2;
-  let div0;
   let t4;
   let t5;
-  let div1;
-  let span0;
-  let fmtCurrency_action;
-  let t6;
-  let div3;
-  let button;
-  let t7;
-  let button_disabled_value;
-  let t8;
-  let div5;
-  let div4;
-  let span1;
-  let fmtCurrency_action_1;
-  let t9;
-  let div12;
   let div8;
+  let div0;
+  let t6;
+  let span0;
+  let t7;
+  let t8;
+  let t9;
   let t10;
-  let div9;
   let t11;
-  let div11;
-  let div10;
-  let icon;
+  let div7;
+  let div3;
+  let div1;
   let t12;
+  let t13;
+  let div2;
+  let span1;
+  let fmtCurrency_action;
+  let t14;
+  let div4;
+  let button;
+  let t15;
+  let button_disabled_value;
+  let t16;
+  let div6;
+  let div5;
+  let span2;
+  let fmtCurrency_action_1;
+  let t17;
   let div13;
+  let div9;
+  let t18;
+  let div10;
+  let t19;
+  let div12;
+  let div11;
+  let icon;
+  let t20;
+  let div14;
   let current;
   let mounted;
   let dispose;
-  let if_block0 = ctx[6] && create_if_block_8(ctx);
-  let if_block1 = ctx[7] && create_if_block_7(ctx);
-  let if_block2 = ctx[8] && create_if_block_6(ctx);
-  let if_block3 = ctx[12] && create_if_block_5(ctx);
-  let each_value_3 = ctx[15].bookingsArray;
+  paymentbanner = new PaymentBanner({
+    props: {
+      items: ctx[19],
+      now: ctx[20]
+    }
+  });
+  paymentbanner.$on("open", ctx[48]);
+  let if_block0 = ctx[6] && create_if_block_10(ctx);
+  let if_block1 = ctx[7] && create_if_block_9(ctx);
+  let if_block2 = ctx[9] && ctx[11] && create_if_block_8(ctx);
+  let if_block3 = ctx[10] && create_if_block_7(ctx);
+  let if_block4 = ctx[8] && create_if_block_6(ctx);
+  let if_block5 = ctx[15] && create_if_block_5(ctx);
+  let each_value_3 = ctx[18].bookingsArray;
   let each_blocks_2 = [];
   for (let i = 0; i < each_value_3.length; i += 1) {
     each_blocks_2[i] = create_each_block_3(get_each_context_3(ctx, each_value_3, i));
@@ -11097,15 +11929,15 @@ function create_fragment(ctx) {
   const out = (i) => transition_out(each_blocks_2[i], 1, 1, () => {
     each_blocks_2[i] = null;
   });
-  let if_block4 = !ctx[15].bookingsArray.length && create_if_block_4();
-  let if_block5 = ctx[13] && create_if_block_3(ctx);
+  let if_block6 = !ctx[18].bookingsArray.length && create_if_block_4();
+  let if_block7 = ctx[16] && create_if_block_3(ctx);
   let each_value_2 = ctx[3];
   let each_blocks_1 = [];
   for (let i = 0; i < each_value_2.length; i += 1) {
     each_blocks_1[i] = create_each_block_2(get_each_context_2(ctx, each_value_2, i));
   }
   icon = new Icon({ props: { name: "chevron-right" } });
-  let each_value = ctx[14];
+  let each_value = ctx[17];
   let each_blocks = [];
   for (let i = 0; i < each_value.length; i += 1) {
     each_blocks[i] = create_each_block(get_each_context(ctx, each_value, i));
@@ -11115,150 +11947,191 @@ function create_fragment(ctx) {
   });
   return {
     c() {
-      div14 = element("div");
+      div15 = element("div");
+      create_component(paymentbanner.$$.fragment);
+      t0 = space();
       if (if_block0)
         if_block0.c();
-      t0 = space();
+      t1 = space();
       if (if_block1)
         if_block1.c();
-      t1 = space();
+      t2 = space();
       if (if_block2)
         if_block2.c();
-      t2 = space();
-      div7 = element("div");
+      t3 = space();
       if (if_block3)
         if_block3.c();
-      t3 = space();
-      div6 = element("div");
-      div2 = element("div");
-      div0 = element("div");
-      for (let i = 0; i < each_blocks_2.length; i += 1) {
-        each_blocks_2[i].c();
-      }
       t4 = space();
       if (if_block4)
         if_block4.c();
       t5 = space();
-      div1 = element("div");
-      span0 = element("span");
-      t6 = space();
-      div3 = element("div");
-      button = element("button");
-      t7 = text("\u0417\u0430\u0431\u0440\u043E\u043D\u0438\u0440\u043E\u0432\u0430\u0442\u044C");
-      t8 = space();
-      div5 = element("div");
-      div4 = element("div");
-      span1 = element("span");
-      t9 = space();
-      div12 = element("div");
       div8 = element("div");
+      div0 = element("div");
+      t6 = text("\u0412\u044B \u0431\u0440\u043E\u043D\u0438\u0440\u0443\u0435\u0442\u0435 ");
+      span0 = element("span");
+      t7 = text(ctx[1]);
+      t8 = text(", ");
+      t9 = text(ctx[2]);
+      t10 = space();
       if (if_block5)
         if_block5.c();
-      t10 = space();
+      t11 = space();
+      div7 = element("div");
+      div3 = element("div");
+      div1 = element("div");
+      for (let i = 0; i < each_blocks_2.length; i += 1) {
+        each_blocks_2[i].c();
+      }
+      t12 = space();
+      if (if_block6)
+        if_block6.c();
+      t13 = space();
+      div2 = element("div");
+      span1 = element("span");
+      t14 = space();
+      div4 = element("div");
+      button = element("button");
+      t15 = text("\u0417\u0430\u0431\u0440\u043E\u043D\u0438\u0440\u043E\u0432\u0430\u0442\u044C");
+      t16 = space();
+      div6 = element("div");
+      div5 = element("div");
+      span2 = element("span");
+      t17 = space();
+      div13 = element("div");
       div9 = element("div");
+      if (if_block7)
+        if_block7.c();
+      t18 = space();
+      div10 = element("div");
       for (let i = 0; i < each_blocks_1.length; i += 1) {
         each_blocks_1[i].c();
       }
-      t11 = space();
+      t19 = space();
+      div12 = element("div");
       div11 = element("div");
-      div10 = element("div");
       create_component(icon.$$.fragment);
-      t12 = space();
-      div13 = element("div");
+      t20 = space();
+      div14 = element("div");
       for (let i = 0; i < each_blocks.length; i += 1) {
         each_blocks[i].c();
       }
-      attr(div0, "class", "basket-panel__products bit-78ux5");
-      attr(span0, "class", "bit-78ux5");
-      attr(div1, "class", "basket-panel__total-price bit-78ux5");
-      attr(div2, "class", "basket-panel__basket bit-78ux5");
+      attr(span0, "class", "fg-primary");
+      set_style(span0, "font-weight", "600");
+      set_style(div0, "height", "48px");
+      set_style(div0, "overflow", "hidden");
+      attr(div1, "class", "basket-panel__products bit-yolhwc");
+      attr(span1, "class", "bit-yolhwc");
+      attr(div2, "class", "basket-panel__total-price bit-yolhwc");
+      attr(div3, "class", "basket-panel__basket bit-yolhwc");
       attr(button, "type", "button");
-      button.disabled = button_disabled_value = ctx[15].totalAmount <= 0;
-      attr(button, "class", "bit-78ux5");
-      attr(div3, "class", "basket-panel__booking-btn bit-78ux5");
-      attr(span1, "class", "bit-78ux5");
-      attr(div4, "class", "basket-panel__total-price bit-78ux5");
-      attr(div5, "class", "basket-panel__mobile-price bit-78ux5");
-      attr(div6, "class", "basket-panel__summary bit-78ux5");
-      attr(div7, "class", "basket-panel bit-78ux5");
-      attr(div8, "class", "calendar__day-nav calendar__day-nav-left bit-78ux5");
-      attr(div9, "class", "calendar__days bit-78ux5");
-      attr(div10, "class", "btn-icon");
-      attr(div11, "class", "calendar__day-nav calendar__day-nav-right bit-78ux5");
-      attr(div12, "class", "calendar__header bit-78ux5");
-      attr(div13, "class", "calendar__rows bit-78ux5");
-      attr(div14, "class", "calendar bit-78ux5");
-      set_style(div14, "--viewDaysCount", ctx[0]);
-      set_style(div14, "--calendarWidth", ctx[11] + "px");
-      toggle_class(div14, "mobile-view", ctx[10]);
+      button.disabled = button_disabled_value = ctx[18].totalAmount <= 0;
+      attr(button, "class", "bit-yolhwc");
+      attr(div4, "class", "basket-panel__booking-btn bit-yolhwc");
+      attr(span2, "class", "bit-yolhwc");
+      attr(div5, "class", "basket-panel__total-price bit-yolhwc");
+      attr(div6, "class", "basket-panel__mobile-price bit-yolhwc");
+      attr(div7, "class", "basket-panel__summary bit-yolhwc");
+      attr(div8, "class", "basket-panel bit-yolhwc");
+      attr(div9, "class", "calendar__day-nav calendar__day-nav-left bit-yolhwc");
+      attr(div10, "class", "calendar__days bit-yolhwc");
+      attr(div11, "class", "btn-icon");
+      attr(div12, "class", "calendar__day-nav calendar__day-nav-right bit-yolhwc");
+      attr(div13, "class", "calendar__header bit-yolhwc");
+      attr(div14, "class", "calendar__rows bit-yolhwc");
+      attr(div15, "class", "calendar bit-yolhwc");
+      set_style(div15, "--viewDaysCount", ctx[0]);
+      set_style(div15, "--calendarWidth", ctx[14] + "px");
+      toggle_class(div15, "mobile-view", ctx[13]);
+      toggle_class(div15, "no-sections", !ctx[15]);
     },
     m(target, anchor) {
-      insert(target, div14, anchor);
+      insert(target, div15, anchor);
+      mount_component(paymentbanner, div15, null);
+      append(div15, t0);
       if (if_block0)
-        if_block0.m(div14, null);
-      append(div14, t0);
+        if_block0.m(div15, null);
+      append(div15, t1);
       if (if_block1)
-        if_block1.m(div14, null);
-      append(div14, t1);
+        if_block1.m(div15, null);
+      append(div15, t2);
       if (if_block2)
-        if_block2.m(div14, null);
-      append(div14, t2);
-      append(div14, div7);
+        if_block2.m(div15, null);
+      append(div15, t3);
       if (if_block3)
-        if_block3.m(div7, null);
-      append(div7, t3);
-      append(div7, div6);
-      append(div6, div2);
-      append(div2, div0);
-      for (let i = 0; i < each_blocks_2.length; i += 1) {
-        each_blocks_2[i].m(div0, null);
-      }
-      append(div0, t4);
+        if_block3.m(div15, null);
+      append(div15, t4);
       if (if_block4)
-        if_block4.m(div0, null);
-      append(div2, t5);
-      append(div2, div1);
-      append(div1, span0);
-      append(div6, t6);
-      append(div6, div3);
-      append(div3, button);
-      append(button, t7);
-      append(div6, t8);
-      append(div6, div5);
-      append(div5, div4);
-      append(div4, span1);
-      append(div14, t9);
-      append(div14, div12);
-      append(div12, div8);
+        if_block4.m(div15, null);
+      append(div15, t5);
+      append(div15, div8);
+      append(div8, div0);
+      append(div0, t6);
+      append(div0, span0);
+      append(span0, t7);
+      append(div0, t8);
+      append(div0, t9);
+      append(div8, t10);
       if (if_block5)
         if_block5.m(div8, null);
-      append(div12, t10);
-      append(div12, div9);
+      append(div8, t11);
+      append(div8, div7);
+      append(div7, div3);
+      append(div3, div1);
+      for (let i = 0; i < each_blocks_2.length; i += 1) {
+        each_blocks_2[i].m(div1, null);
+      }
+      append(div1, t12);
+      if (if_block6)
+        if_block6.m(div1, null);
+      append(div3, t13);
+      append(div3, div2);
+      append(div2, span1);
+      append(div7, t14);
+      append(div7, div4);
+      append(div4, button);
+      append(button, t15);
+      append(div7, t16);
+      append(div7, div6);
+      append(div6, div5);
+      append(div5, span2);
+      append(div15, t17);
+      append(div15, div13);
+      append(div13, div9);
+      if (if_block7)
+        if_block7.m(div9, null);
+      append(div13, t18);
+      append(div13, div10);
       for (let i = 0; i < each_blocks_1.length; i += 1) {
-        each_blocks_1[i].m(div9, null);
+        each_blocks_1[i].m(div10, null);
       }
-      append(div12, t11);
+      append(div13, t19);
+      append(div13, div12);
       append(div12, div11);
-      append(div11, div10);
-      mount_component(icon, div10, null);
-      append(div14, t12);
-      append(div14, div13);
+      mount_component(icon, div11, null);
+      append(div15, t20);
+      append(div15, div14);
       for (let i = 0; i < each_blocks.length; i += 1) {
-        each_blocks[i].m(div13, null);
+        each_blocks[i].m(div14, null);
       }
-      ctx[49](div14);
+      ctx[66](div15);
       current = true;
       if (!mounted) {
         dispose = [
-          action_destroyer(fmtCurrency_action = fmtCurrency.call(null, span0, ctx[15].totalAmount)),
-          listen(button, "click", ctx[47]),
-          action_destroyer(fmtCurrency_action_1 = fmtCurrency.call(null, span1, ctx[15].totalAmount)),
-          listen(div10, "click", ctx[24])
+          action_destroyer(fmtCurrency_action = fmtCurrency.call(null, span1, ctx[18].totalAmount)),
+          listen(button, "click", ctx[35]),
+          action_destroyer(fmtCurrency_action_1 = fmtCurrency.call(null, span2, ctx[18].totalAmount)),
+          listen(div11, "click", ctx[31])
         ];
         mounted = true;
       }
     },
     p(ctx2, dirty) {
+      const paymentbanner_changes = {};
+      if (dirty[0] & 524288)
+        paymentbanner_changes.items = ctx2[19];
+      if (dirty[0] & 1048576)
+        paymentbanner_changes.now = ctx2[20];
+      paymentbanner.$set(paymentbanner_changes);
       if (ctx2[6]) {
         if (if_block0) {
           if_block0.p(ctx2, dirty);
@@ -11266,10 +12139,10 @@ function create_fragment(ctx) {
             transition_in(if_block0, 1);
           }
         } else {
-          if_block0 = create_if_block_8(ctx2);
+          if_block0 = create_if_block_10(ctx2);
           if_block0.c();
           transition_in(if_block0, 1);
-          if_block0.m(div14, t0);
+          if_block0.m(div15, t1);
         }
       } else if (if_block0) {
         group_outros();
@@ -11285,10 +12158,10 @@ function create_fragment(ctx) {
             transition_in(if_block1, 1);
           }
         } else {
-          if_block1 = create_if_block_7(ctx2);
+          if_block1 = create_if_block_9(ctx2);
           if_block1.c();
           transition_in(if_block1, 1);
-          if_block1.m(div14, t1);
+          if_block1.m(div15, t2);
         }
       } else if (if_block1) {
         group_outros();
@@ -11297,17 +12170,17 @@ function create_fragment(ctx) {
         });
         check_outros();
       }
-      if (ctx2[8]) {
+      if (ctx2[9] && ctx2[11]) {
         if (if_block2) {
           if_block2.p(ctx2, dirty);
-          if (dirty[0] & 256) {
+          if (dirty[0] & 2560) {
             transition_in(if_block2, 1);
           }
         } else {
-          if_block2 = create_if_block_6(ctx2);
+          if_block2 = create_if_block_8(ctx2);
           if_block2.c();
           transition_in(if_block2, 1);
-          if_block2.m(div14, t2);
+          if_block2.m(div15, t3);
         }
       } else if (if_block2) {
         group_outros();
@@ -11316,20 +12189,62 @@ function create_fragment(ctx) {
         });
         check_outros();
       }
-      if (ctx2[12]) {
+      if (ctx2[10]) {
         if (if_block3) {
           if_block3.p(ctx2, dirty);
+          if (dirty[0] & 1024) {
+            transition_in(if_block3, 1);
+          }
         } else {
-          if_block3 = create_if_block_5(ctx2);
+          if_block3 = create_if_block_7(ctx2);
           if_block3.c();
-          if_block3.m(div7, t3);
+          transition_in(if_block3, 1);
+          if_block3.m(div15, t4);
         }
       } else if (if_block3) {
-        if_block3.d(1);
-        if_block3 = null;
+        group_outros();
+        transition_out(if_block3, 1, 1, () => {
+          if_block3 = null;
+        });
+        check_outros();
       }
-      if (dirty[0] & 4227072) {
-        each_value_3 = ctx2[15].bookingsArray;
+      if (ctx2[8]) {
+        if (if_block4) {
+          if_block4.p(ctx2, dirty);
+          if (dirty[0] & 256) {
+            transition_in(if_block4, 1);
+          }
+        } else {
+          if_block4 = create_if_block_6(ctx2);
+          if_block4.c();
+          transition_in(if_block4, 1);
+          if_block4.m(div15, t5);
+        }
+      } else if (if_block4) {
+        group_outros();
+        transition_out(if_block4, 1, 1, () => {
+          if_block4 = null;
+        });
+        check_outros();
+      }
+      if (!current || dirty[0] & 2)
+        set_data(t7, ctx2[1]);
+      if (!current || dirty[0] & 4)
+        set_data(t9, ctx2[2]);
+      if (ctx2[15]) {
+        if (if_block5) {
+          if_block5.p(ctx2, dirty);
+        } else {
+          if_block5 = create_if_block_5(ctx2);
+          if_block5.c();
+          if_block5.m(div8, t11);
+        }
+      } else if (if_block5) {
+        if_block5.d(1);
+        if_block5 = null;
+      }
+      if (dirty[0] & 537133056) {
+        each_value_3 = ctx2[18].bookingsArray;
         let i;
         for (i = 0; i < each_value_3.length; i += 1) {
           const child_ctx = get_each_context_3(ctx2, each_value_3, i);
@@ -11340,7 +12255,7 @@ function create_fragment(ctx) {
             each_blocks_2[i] = create_each_block_3(child_ctx);
             each_blocks_2[i].c();
             transition_in(each_blocks_2[i], 1);
-            each_blocks_2[i].m(div0, t4);
+            each_blocks_2[i].m(div1, t12);
           }
         }
         group_outros();
@@ -11349,41 +12264,41 @@ function create_fragment(ctx) {
         }
         check_outros();
       }
-      if (!ctx2[15].bookingsArray.length) {
-        if (if_block4)
+      if (!ctx2[18].bookingsArray.length) {
+        if (if_block6)
           ;
         else {
-          if_block4 = create_if_block_4();
-          if_block4.c();
-          if_block4.m(div0, null);
+          if_block6 = create_if_block_4();
+          if_block6.c();
+          if_block6.m(div1, null);
         }
-      } else if (if_block4) {
-        if_block4.d(1);
-        if_block4 = null;
+      } else if (if_block6) {
+        if_block6.d(1);
+        if_block6 = null;
       }
-      if (fmtCurrency_action && is_function(fmtCurrency_action.update) && dirty[0] & 32768)
-        fmtCurrency_action.update.call(null, ctx2[15].totalAmount);
-      if (!current || dirty[0] & 32768 && button_disabled_value !== (button_disabled_value = ctx2[15].totalAmount <= 0)) {
+      if (fmtCurrency_action && is_function(fmtCurrency_action.update) && dirty[0] & 262144)
+        fmtCurrency_action.update.call(null, ctx2[18].totalAmount);
+      if (!current || dirty[0] & 262144 && button_disabled_value !== (button_disabled_value = ctx2[18].totalAmount <= 0)) {
         button.disabled = button_disabled_value;
       }
-      if (fmtCurrency_action_1 && is_function(fmtCurrency_action_1.update) && dirty[0] & 32768)
-        fmtCurrency_action_1.update.call(null, ctx2[15].totalAmount);
-      if (ctx2[13]) {
-        if (if_block5) {
-          if_block5.p(ctx2, dirty);
-          if (dirty[0] & 8192) {
-            transition_in(if_block5, 1);
+      if (fmtCurrency_action_1 && is_function(fmtCurrency_action_1.update) && dirty[0] & 262144)
+        fmtCurrency_action_1.update.call(null, ctx2[18].totalAmount);
+      if (ctx2[16]) {
+        if (if_block7) {
+          if_block7.p(ctx2, dirty);
+          if (dirty[0] & 65536) {
+            transition_in(if_block7, 1);
           }
         } else {
-          if_block5 = create_if_block_3(ctx2);
-          if_block5.c();
-          transition_in(if_block5, 1);
-          if_block5.m(div8, null);
+          if_block7 = create_if_block_3(ctx2);
+          if_block7.c();
+          transition_in(if_block7, 1);
+          if_block7.m(div9, null);
         }
-      } else if (if_block5) {
+      } else if (if_block7) {
         group_outros();
-        transition_out(if_block5, 1, 1, () => {
-          if_block5 = null;
+        transition_out(if_block7, 1, 1, () => {
+          if_block7 = null;
         });
         check_outros();
       }
@@ -11397,7 +12312,7 @@ function create_fragment(ctx) {
           } else {
             each_blocks_1[i] = create_each_block_2(child_ctx);
             each_blocks_1[i].c();
-            each_blocks_1[i].m(div9, null);
+            each_blocks_1[i].m(div10, null);
           }
         }
         for (; i < each_blocks_1.length; i += 1) {
@@ -11405,8 +12320,8 @@ function create_fragment(ctx) {
         }
         each_blocks_1.length = each_value_2.length;
       }
-      if (dirty[0] & 8994824) {
-        each_value = ctx2[14];
+      if (dirty[0] & 1143078920) {
+        each_value = ctx2[17];
         let i;
         for (i = 0; i < each_value.length; i += 1) {
           const child_ctx = get_each_context(ctx2, each_value, i);
@@ -11417,7 +12332,7 @@ function create_fragment(ctx) {
             each_blocks[i] = create_each_block(child_ctx);
             each_blocks[i].c();
             transition_in(each_blocks[i], 1);
-            each_blocks[i].m(div13, null);
+            each_blocks[i].m(div14, null);
           }
         }
         group_outros();
@@ -11427,25 +12342,31 @@ function create_fragment(ctx) {
         check_outros();
       }
       if (!current || dirty[0] & 1) {
-        set_style(div14, "--viewDaysCount", ctx2[0]);
+        set_style(div15, "--viewDaysCount", ctx2[0]);
       }
-      if (!current || dirty[0] & 2048) {
-        set_style(div14, "--calendarWidth", ctx2[11] + "px");
+      if (!current || dirty[0] & 16384) {
+        set_style(div15, "--calendarWidth", ctx2[14] + "px");
       }
-      if (dirty[0] & 1024) {
-        toggle_class(div14, "mobile-view", ctx2[10]);
+      if (dirty[0] & 8192) {
+        toggle_class(div15, "mobile-view", ctx2[13]);
+      }
+      if (dirty[0] & 32768) {
+        toggle_class(div15, "no-sections", !ctx2[15]);
       }
     },
     i(local) {
       if (current)
         return;
+      transition_in(paymentbanner.$$.fragment, local);
       transition_in(if_block0);
       transition_in(if_block1);
       transition_in(if_block2);
+      transition_in(if_block3);
+      transition_in(if_block4);
       for (let i = 0; i < each_value_3.length; i += 1) {
         transition_in(each_blocks_2[i]);
       }
-      transition_in(if_block5);
+      transition_in(if_block7);
       transition_in(icon.$$.fragment, local);
       for (let i = 0; i < each_value.length; i += 1) {
         transition_in(each_blocks[i]);
@@ -11453,14 +12374,17 @@ function create_fragment(ctx) {
       current = true;
     },
     o(local) {
+      transition_out(paymentbanner.$$.fragment, local);
       transition_out(if_block0);
       transition_out(if_block1);
       transition_out(if_block2);
+      transition_out(if_block3);
+      transition_out(if_block4);
       each_blocks_2 = each_blocks_2.filter(Boolean);
       for (let i = 0; i < each_blocks_2.length; i += 1) {
         transition_out(each_blocks_2[i]);
       }
-      transition_out(if_block5);
+      transition_out(if_block7);
       transition_out(icon.$$.fragment, local);
       each_blocks = each_blocks.filter(Boolean);
       for (let i = 0; i < each_blocks.length; i += 1) {
@@ -11470,7 +12394,8 @@ function create_fragment(ctx) {
     },
     d(detaching) {
       if (detaching)
-        detach(div14);
+        detach(div15);
+      destroy_component(paymentbanner);
       if (if_block0)
         if_block0.d();
       if (if_block1)
@@ -11479,15 +12404,19 @@ function create_fragment(ctx) {
         if_block2.d();
       if (if_block3)
         if_block3.d();
-      destroy_each(each_blocks_2, detaching);
       if (if_block4)
         if_block4.d();
       if (if_block5)
         if_block5.d();
+      destroy_each(each_blocks_2, detaching);
+      if (if_block6)
+        if_block6.d();
+      if (if_block7)
+        if_block7.d();
       destroy_each(each_blocks_1, detaching);
       destroy_component(icon);
       destroy_each(each_blocks, detaching);
-      ctx[49](null);
+      ctx[66](null);
       mounted = false;
       run_all(dispose);
     }
@@ -11513,6 +12442,24 @@ function generateHours(from, delta) {
 function getSlotKey(dt) {
   return dt.getTime();
 }
+function withTimeout(p, ms) {
+  return Promise.race([p, new Promise((resolve) => setTimeout(() => resolve(null), ms))]);
+}
+function openPayment(p) {
+  if (p == null ? void 0 : p.link) {
+    window.open(p.link, "_blank");
+  }
+}
+function paymentRemainingText(p, nowTs) {
+  if (!p) {
+    return "";
+  }
+  const ms = new Date(p.expired_at).getTime() - nowTs;
+  const total = Math.max(0, Math.floor(ms / 1e3));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
 function instance($$self, $$props, $$invalidate) {
   let mobile;
   let calendarWidth;
@@ -11525,6 +12472,8 @@ function instance($$self, $$props, $$invalidate) {
   let hasSections;
   let activeSection;
   let $selectedSlots;
+  let $pendingPayments;
+  let $paymentNow;
   let $storeSlots;
   let { placeName = "" } = $$props;
   let { placeAddress = "" } = $$props;
@@ -11536,32 +12485,71 @@ function instance($$self, $$props, $$invalidate) {
   let { getTimeZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone } = $$props;
   let { getSections = () => [] } = $$props;
   let { postBooking } = $$props;
+  let { minOrderHour = 1 } = $$props;
+  let { source_id = 3 } = $$props;
+  let { paymentApi = null } = $$props;
   const minDate = startOfDay(new Date());
   const timeZone = getTimeZone();
   const { storeSlots, storeUpdateSlot, storeUpdate, selectedSlots, loadSlots, clearStore } = createSlotsStore();
-  component_subscribe($$self, storeSlots, (value) => $$invalidate(16, $storeSlots = value));
-  component_subscribe($$self, selectedSlots, (value) => $$invalidate(15, $selectedSlots = value));
+  component_subscribe($$self, storeSlots, (value) => $$invalidate(21, $storeSlots = value));
+  component_subscribe($$self, selectedSlots, (value) => $$invalidate(18, $selectedSlots = value));
   let showConfirmBooking = false;
   let showSuccessBooking = false;
   let showErrorBooking = false;
+  let showPaymentBooking = false;
+  let showPaidBooking = false;
+  let paymentItem = null;
   let containerEl = null;
+  const paymentStore = safeCreatePaymentStore();
+  const { pending: pendingPayments, now: paymentNow } = paymentStore;
+  component_subscribe($$self, pendingPayments, (value) => $$invalidate(19, $pendingPayments = value));
+  component_subscribe($$self, paymentNow, (value) => $$invalidate(20, $paymentNow = value));
+  function safeCreatePaymentStore() {
+    try {
+      return createPaymentStore({ onPaid });
+    } catch (err) {
+      console.error("payment store creation failed, feature disabled", err);
+      return {
+        pending: writable([]),
+        now: writable(Date.now()),
+        addPending: () => {
+        },
+        removeByGuid: () => {
+        },
+        init: () => {
+        },
+        dispose: () => {
+        }
+      };
+    }
+  }
   onMount(() => {
     setupScreen();
     const debounceResize = debounce(() => {
       requestAnimationFrame(setupScreen);
     }, 100);
     window.addEventListener("resize", debounceResize);
+    try {
+      paymentStore.init();
+    } catch (err) {
+      console.error("payment store init failed", err);
+    }
     return () => {
       window.removeEventListener("resize", debounceResize);
+      try {
+        paymentStore.dispose();
+      } catch (err) {
+        console.error("payment store dispose failed", err);
+      }
     };
   });
   function setupScreen() {
     const vw = window.outerWidth;
-    $$invalidate(10, mobile = window.outerWidth < 980);
+    $$invalidate(13, mobile = window.outerWidth < 980);
     const nav = mobile ? 40 : 60;
     const slot = mobile ? 80 : 120;
     $$invalidate(0, viewDaysCount = Math.min(7, Math.floor((vw - 2 * nav) / slot)));
-    $$invalidate(11, calendarWidth = mobile ? viewDaysCount * slot + 2 * nav : viewDaysCount * slot + 2 * nav);
+    $$invalidate(14, calendarWidth = mobile ? viewDaysCount * slot + 2 * nav : viewDaysCount * slot + 2 * nav);
   }
   async function refreshSlots() {
     await updateSlots(slotsFromDate, slotsToDate, activeSection);
@@ -11579,8 +12567,8 @@ function instance($$self, $$props, $$invalidate) {
     slot.selected = !slot.selected;
     storeUpdateSlot(key, slot);
   }
-  async function onPostBooking(contact) {
-    await postBooking(contact, $selectedSlots.bookingsArray, activeSection);
+  async function onPostBooking(contact, data) {
+    return await postBooking(contact, $selectedSlots.bookingsArray, activeSection, data);
   }
   function setActiveSectionTab(tab) {
     $$invalidate(4, activeSection = tab);
@@ -11626,11 +12614,45 @@ function instance($$self, $$props, $$invalidate) {
     const { date: date2 } = viewDays[0];
     $$invalidate(3, viewDays = generateViewDays(addDays(date2, -1 * viewDaysCount), viewDaysCount));
   }
-  function successBooking() {
+  async function successBooking(e) {
+    var _a, _b;
     $$invalidate(6, showConfirmBooking = false);
-    $$invalidate(7, showSuccessBooking = true);
     refreshSlots();
     clearStore();
+    try {
+      const orderGuid = (_b = (_a = e == null ? void 0 : e.detail) == null ? void 0 : _a.details) == null ? void 0 : _b.order_guid;
+      if (orderGuid && paymentApi) {
+        const link = await withTimeout(paymentApi.createLink(orderGuid), 1e4);
+        if (link && link.guid && link.link) {
+          $$invalidate(11, paymentItem = toPending(link));
+          paymentStore.addPending(paymentItem);
+          $$invalidate(9, showPaymentBooking = true);
+          return;
+        }
+      }
+    } catch (err) {
+      console.error("draft payment flow failed, fallback to success", err);
+    }
+    $$invalidate(7, showSuccessBooking = true);
+  }
+  function toPending(link) {
+    var _a;
+    return {
+      guid: link.guid,
+      link: link.link,
+      expired_at: link.expired_at,
+      amount: link.amount,
+      order_id: (_a = link.subject) == null ? void 0 : _a.order_id,
+      placeName,
+      statusUrl: paymentApi.statusUrl(link.guid)
+    };
+  }
+  function onPaid(p) {
+    if (paymentItem && paymentItem.guid === p.guid) {
+      $$invalidate(9, showPaymentBooking = false);
+      $$invalidate(11, paymentItem = null);
+    }
+    $$invalidate(10, showPaidBooking = true);
   }
   function errorBooking(e) {
     $$invalidate(6, showConfirmBooking = false);
@@ -11638,22 +12660,46 @@ function instance($$self, $$props, $$invalidate) {
     refreshSlots();
     clearStore();
   }
+  function onBookingClick() {
+    const validResult = validBooking();
+    if (validResult === true) {
+      $$invalidate(6, showConfirmBooking = true);
+    } else {
+      alert(validResult);
+    }
+  }
+  function validBooking() {
+    const minBookings = Object.values($selectedSlots.bookings || {}).filter((b) => {
+      return b.durationHours < minOrderHour;
+    });
+    if (minBookings.length > 0) {
+      const times = minBookings.map((b) => b.fromToName).join(", ");
+      return `\u041C\u0438\u043D\u0438\u043C\u0430\u043B\u044C\u043D\u044B\u0439 \u0437\u0430\u043A\u0430\u0437 \u0434\u043E\u043B\u0436\u0435\u043D \u0431\u044B\u0442\u044C ${minOrderHour} \u0447\u0430\u0441. \u0423\u0432\u0435\u043B\u0438\u0447\u044C\u0442\u0435 \u0432\u0440\u0435\u043C\u044F: ${times}`;
+    }
+    return true;
+  }
+  const open_handler = (e) => openPayment(e.detail);
   const close_handler = () => $$invalidate(6, showConfirmBooking = false);
   const overlayClick_handler = () => $$invalidate(6, showConfirmBooking = false);
   const click_handler = () => $$invalidate(7, showSuccessBooking = false);
   const close_handler_1 = () => $$invalidate(7, showSuccessBooking = false);
   const overlayClick_handler_1 = () => $$invalidate(7, showSuccessBooking = false);
-  const click_handler_1 = () => $$invalidate(8, showErrorBooking = false);
-  const close_handler_2 = () => $$invalidate(8, showErrorBooking = false);
-  const overlayClick_handler_2 = () => $$invalidate(8, showErrorBooking = false);
-  const click_handler_2 = (tab) => setActiveSectionTab(tab);
-  const click_handler_3 = (book) => removeSelectedBooking(book);
-  const click_handler_4 = () => $$invalidate(6, showConfirmBooking = true);
-  const click_handler_5 = (slot) => onSlotClick(slot);
-  function div14_binding($$value) {
+  const click_handler_1 = () => openPayment(paymentItem);
+  const close_handler_2 = () => $$invalidate(9, showPaymentBooking = false);
+  const overlayClick_handler_2 = () => $$invalidate(9, showPaymentBooking = false);
+  const click_handler_2 = () => $$invalidate(10, showPaidBooking = false);
+  const close_handler_3 = () => $$invalidate(10, showPaidBooking = false);
+  const overlayClick_handler_3 = () => $$invalidate(10, showPaidBooking = false);
+  const click_handler_3 = () => $$invalidate(8, showErrorBooking = false);
+  const close_handler_4 = () => $$invalidate(8, showErrorBooking = false);
+  const overlayClick_handler_4 = () => $$invalidate(8, showErrorBooking = false);
+  const click_handler_4 = (tab) => setActiveSectionTab(tab);
+  const click_handler_5 = (book) => removeSelectedBooking(book);
+  const click_handler_6 = (slot) => onSlotClick(slot);
+  function div15_binding($$value) {
     binding_callbacks[$$value ? "unshift" : "push"](() => {
       containerEl = $$value;
-      $$invalidate(9, containerEl);
+      $$invalidate(12, containerEl);
     });
   }
   $$self.$$set = ($$props2) => {
@@ -11662,54 +12708,60 @@ function instance($$self, $$props, $$invalidate) {
     if ("placeAddress" in $$props2)
       $$invalidate(2, placeAddress = $$props2.placeAddress);
     if ("startDate" in $$props2)
-      $$invalidate(28, startDate = $$props2.startDate);
+      $$invalidate(36, startDate = $$props2.startDate);
     if ("startHour" in $$props2)
-      $$invalidate(29, startHour = $$props2.startHour);
+      $$invalidate(37, startHour = $$props2.startHour);
     if ("deltaHour" in $$props2)
-      $$invalidate(30, deltaHour = $$props2.deltaHour);
+      $$invalidate(38, deltaHour = $$props2.deltaHour);
     if ("viewDaysCount" in $$props2)
       $$invalidate(0, viewDaysCount = $$props2.viewDaysCount);
     if ("getSlots" in $$props2)
-      $$invalidate(31, getSlots = $$props2.getSlots);
+      $$invalidate(39, getSlots = $$props2.getSlots);
     if ("getTimeZone" in $$props2)
-      $$invalidate(32, getTimeZone = $$props2.getTimeZone);
+      $$invalidate(40, getTimeZone = $$props2.getTimeZone);
     if ("getSections" in $$props2)
-      $$invalidate(33, getSections = $$props2.getSections);
+      $$invalidate(41, getSections = $$props2.getSections);
     if ("postBooking" in $$props2)
-      $$invalidate(34, postBooking = $$props2.postBooking);
+      $$invalidate(42, postBooking = $$props2.postBooking);
+    if ("minOrderHour" in $$props2)
+      $$invalidate(43, minOrderHour = $$props2.minOrderHour);
+    if ("source_id" in $$props2)
+      $$invalidate(44, source_id = $$props2.source_id);
+    if ("paymentApi" in $$props2)
+      $$invalidate(45, paymentApi = $$props2.paymentApi);
   };
   $$self.$$.update = () => {
     var _a;
-    if ($$self.$$.dirty[0] & 268435457) {
+    if ($$self.$$.dirty[0] & 1 | $$self.$$.dirty[1] & 32) {
       $$invalidate(3, viewDays = generateViewDays(new Date(startDate), viewDaysCount));
     }
-    if ($$self.$$.dirty[0] & 1610612736) {
-      $$invalidate(14, viewHours = generateHours(startHour, deltaHour));
+    if ($$self.$$.dirty[1] & 192) {
+      $$invalidate(17, viewHours = generateHours(startHour, deltaHour));
     }
     if ($$self.$$.dirty[0] & 8) {
-      $$invalidate(13, showPrevBtn = ((_a = viewDays[0]) == null ? void 0 : _a.date) > minDate);
+      $$invalidate(16, showPrevBtn = ((_a = viewDays[0]) == null ? void 0 : _a.date) > minDate);
     }
     if ($$self.$$.dirty[0] & 8) {
-      $$invalidate(36, slotsFromDate = viewDays[0].date);
+      $$invalidate(47, slotsFromDate = viewDays[0].date);
     }
     if ($$self.$$.dirty[0] & 8) {
-      $$invalidate(35, slotsToDate = addDays(viewDays[viewDays.length - 1].date, 1));
+      $$invalidate(46, slotsToDate = addDays(viewDays[viewDays.length - 1].date, 1));
     }
-    if ($$self.$$.dirty[1] & 4) {
+    if ($$self.$$.dirty[1] & 1024) {
       $$invalidate(5, sectionsTab = getSections());
     }
     if ($$self.$$.dirty[0] & 32) {
-      $$invalidate(12, hasSections = (sectionsTab == null ? void 0 : sectionsTab.length) > 0);
+      $$invalidate(15, hasSections = (sectionsTab == null ? void 0 : sectionsTab.length) > 0);
     }
     if ($$self.$$.dirty[0] & 32) {
       $$invalidate(4, activeSection = sectionsTab[0]);
     }
-    if ($$self.$$.dirty[0] & 16 | $$self.$$.dirty[1] & 48) {
+    if ($$self.$$.dirty[0] & 16 | $$self.$$.dirty[1] & 98304) {
       updateSlots(slotsFromDate, slotsToDate, activeSection);
     }
   };
-  $$invalidate(10, mobile = false);
-  $$invalidate(11, calendarWidth = 980);
+  $$invalidate(13, mobile = false);
+  $$invalidate(14, calendarWidth = 980);
   return [
     viewDaysCount,
     placeName,
@@ -11720,6 +12772,9 @@ function instance($$self, $$props, $$invalidate) {
     showConfirmBooking,
     showSuccessBooking,
     showErrorBooking,
+    showPaymentBooking,
+    showPaidBooking,
+    paymentItem,
     containerEl,
     mobile,
     calendarWidth,
@@ -11727,9 +12782,13 @@ function instance($$self, $$props, $$invalidate) {
     showPrevBtn,
     viewHours,
     $selectedSlots,
+    $pendingPayments,
+    $paymentNow,
     $storeSlots,
     storeSlots,
     selectedSlots,
+    pendingPayments,
+    paymentNow,
     onSlotClick,
     onPostBooking,
     setActiveSectionTab,
@@ -11739,6 +12798,7 @@ function instance($$self, $$props, $$invalidate) {
     loadPrevWeek,
     successBooking,
     errorBooking,
+    onBookingClick,
     startDate,
     startHour,
     deltaHour,
@@ -11746,8 +12806,12 @@ function instance($$self, $$props, $$invalidate) {
     getTimeZone,
     getSections,
     postBooking,
+    minOrderHour,
+    source_id,
+    paymentApi,
     slotsToDate,
     slotsFromDate,
+    open_handler,
     close_handler,
     overlayClick_handler,
     click_handler,
@@ -11757,10 +12821,15 @@ function instance($$self, $$props, $$invalidate) {
     close_handler_2,
     overlayClick_handler_2,
     click_handler_2,
+    close_handler_3,
+    overlayClick_handler_3,
     click_handler_3,
+    close_handler_4,
+    overlayClick_handler_4,
     click_handler_4,
     click_handler_5,
-    div14_binding
+    click_handler_6,
+    div15_binding
   ];
 }
 class BookingCalendar extends SvelteComponent {
@@ -11769,20 +12838,24 @@ class BookingCalendar extends SvelteComponent {
     init(this, options, instance, create_fragment, safe_not_equal, {
       placeName: 1,
       placeAddress: 2,
-      startDate: 28,
-      startHour: 29,
-      deltaHour: 30,
+      startDate: 36,
+      startHour: 37,
+      deltaHour: 38,
       viewDaysCount: 0,
-      getSlots: 31,
-      getTimeZone: 32,
-      getSections: 33,
-      postBooking: 34
-    }, add_css, [-1, -1, -1]);
+      getSlots: 39,
+      getTimeZone: 40,
+      getSections: 41,
+      postBooking: 42,
+      minOrderHour: 43,
+      source_id: 44,
+      paymentApi: 45
+    }, add_css, [-1, -1, -1, -1]);
   }
 }
 function defaultOptions() {
   return {
-    postBookingUrl: "https://api.beinteam.ru/public/orders"
+    postBookingUrl: "https://api.beinteam.ru/public/orders",
+    source_id: 3
   };
 }
 function createCalendar(el, options) {
@@ -11796,8 +12869,8 @@ function createCalendar(el, options) {
     }
     return fetch(url, { mode: "cors" }).then((r) => r.json());
   }
-  async function postBooking(contact, bookings, section) {
-    console.log({ contact, bookings, section });
+  async function postBooking(contact, bookings, section, meta) {
+    console.log({ contact, bookings, section, meta });
     const products = bookings.map((b) => {
       return {
         product_id: 1,
@@ -11807,7 +12880,8 @@ function createCalendar(el, options) {
           date_from: dateToISO(b.from),
           date_to: dateToISO(b.to),
           place_id: options.placeId,
-          section_id: (section == null ? void 0 : section.id) || void 0
+          section_id: (section == null ? void 0 : section.id) || void 0,
+          activity_id: meta.activity.id
         }
       };
     });
@@ -11821,7 +12895,8 @@ function createCalendar(el, options) {
         last_name: contact.surname,
         phone: contact.phone
       },
-      products
+      products,
+      source_id: options.source_id
     };
     console.log(data);
     const response = await fetch(options.postBookingUrl, {
@@ -11832,20 +12907,29 @@ function createCalendar(el, options) {
       },
       mode: "cors"
     });
+    if (!String(response.status).startsWith("2")) {
+      throw new Error("\u041F\u0440\u043E\u0438\u0437\u043E\u0448\u043B\u0430 \u043E\u0448\u0438\u0431\u043A\u0430, \u043E\u0431\u0440\u0430\u0442\u0438\u0442\u0435\u0441\u044C \u0432 \u0442\u0435\u0445\u043D\u0438\u0447\u0435\u0441\u043A\u0443\u044E \u043F\u043E\u0434\u0434\u0435\u0440\u0436\u043A\u0443.");
+    }
     return await response.json();
   }
+  const paymentApi = {
+    createLink: (orderGuid) => requestPaymentLink(paymentLinkUrl(options.postBookingUrl, orderGuid)),
+    statusUrl: (guid) => paymentStatusUrl(options.postBookingUrl, guid)
+  };
   return new BookingCalendar({
     target: el,
     props: {
       placeName: options == null ? void 0 : options.placeName,
       placeAddress: options == null ? void 0 : options.placeAddress,
       startDate: (options == null ? void 0 : options.startDate) || new Date(),
-      startHour: (options == null ? void 0 : options.startHour) || 7,
+      startHour: typeof (options == null ? void 0 : options.startHour) === "number" ? options == null ? void 0 : options.startHour : 7,
       deltaHour: (options == null ? void 0 : options.deltaHour) || 0.5,
       getTimeZone: () => options == null ? void 0 : options.timeZone,
       getSections: () => (options == null ? void 0 : options.sections) || [],
       getSlots: serverSlots,
-      postBooking
+      postBooking,
+      minOrderHour: options.minOrderHour,
+      paymentApi
     }
   });
 }
